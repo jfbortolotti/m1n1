@@ -2,6 +2,7 @@
 
 from ..hv import TraceMode
 from ..utils import *
+import datetime
 
 __all__ = []
 
@@ -167,7 +168,7 @@ class PrintTracer(Tracer):
                    f"0x{evt.addr:x} ({name}, offset {evt.addr - start:#04x}) = 0x{evt.data:x}")
         print(logline)
         if self.log_file:
-            self.log_file.write(f"# {logline}\n")
+            self.log_file.write(f"{datetime.datetime.now()}:# {logline}\n")
             width = 8 << evt.flags.WIDTH
             if evt.flags.WRITE:
                 stmt = f"p.write{width}({start:#x} + {evt.addr - start:#x}, {evt.data:#x})\n"

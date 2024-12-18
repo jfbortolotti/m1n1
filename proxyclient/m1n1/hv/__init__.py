@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-import io, sys, traceback, struct, array, bisect, os, plistlib, signal, runpy
+import io, sys, traceback, struct, array, bisect, os, plistlib, signal, runpy, datetime
 from construct import *
 
 from ..asm import ARMAsm
@@ -112,7 +112,7 @@ class HV(Reloadable):
         self.ctx = None
         self.hvcall_handlers = {}
         self.switching_context = False
-        self.show_timestamps = False
+        self.show_timestamps = True
         self.virtio_devs = {}
 
     def _reloadme(self):
@@ -140,14 +140,14 @@ class HV(Reloadable):
         if self.ctx is not None and show_cpu:
             ts=""
             if self.show_timestamps:
-                ts = f"[{self.u.mrs(CNTPCT_EL0):#x}]"
+                ts = f"[{datetime.datetime.now()}-{self.u.mrs(CNTPCT_EL0):#x}]"
             print(ts+f"[cpu{self.ctx.cpu_id}] " + s, *args, **kwargs)
             if self.print_tracer.log_file:
                 print(f"# {ts}[cpu{self.ctx.cpu_id}] " + s, *args, file=self.print_tracer.log_file, **kwargs)
         else:
             print(s, *args, **kwargs)
             if self.print_tracer.log_file:
-                print("# " + s, *args, file=self.print_tracer.log_file, **kwargs)
+                print(f"# [{datetime.datetime.now()}]" + s, *args, file=self.print_tracer.log_file, **kwargs)
 
     def unmap(self, ipa, size):
         assert self.p.hv_map(ipa, 0, size, 0) >= 0
