@@ -47,6 +47,8 @@ class ProxyUtils(Reloadable):
 
         self.ba = self.iface.readstruct(self.ba_addr, BootArgs)
 
+        print(f"base:{hex(self.base)} top_of_kernel:{self.ba.top_of_kernel_data}\n")
+
         # We allocate a 128MB heap, 128MB after the m1n1 heap, without telling it about it.
         # This frees up from having to coordinate memory management or free stuff after a Python
         # script runs, at the expense that if m1n1 ever uses more than 128MB of heap it will
@@ -56,16 +58,20 @@ class ProxyUtils(Reloadable):
         self.heap_size = heap_size
         try:
             self.heap_base = p.heapblock_alloc(0)
+            print(f"heap_base in try:{hex(self.heap_base)}\n")
         except ProxyRemoteError:
             # Compat with versions that don't have heapblock yet
             self.heap_base = (self.base + ((self.ba.top_of_kernel_data + 0xffff) & ~0xffff) -
                               self.ba.phys_base)
+            print(f"heap_base in ProxyRemoteError:{hex(self.heap_base)}\n")
 
         if os.environ.get("M1N1HEAP", ""):
             self.heap_base = int(os.environ.get("M1N1HEAP", ""), 16)
+            print(f"heap_base from env M1N1HEAP: {self.heap_base}\n")
 
         self.heap_base += 128 * 1024 * 1024 # We leave 128MB for m1n1 heap
         self.heap_top = self.heap_base + self.heap_size
+        print(f"heap_top:{hex(self.heap_top)}\n")
         self.heap = Heap(self.heap_base, self.heap_top)
         self.proxy.heap = self.heap
 
