@@ -114,6 +114,9 @@ if args.shell:
 
 hv.start()
 
+hv.p.write32(0x23d2b001c,0)
+print("WDT disabled\n")
+
 run_shell(hv.shell_locals, "Hypervisor exited. Entering shell.")
 
 p.smp_stop_secondaries(True)

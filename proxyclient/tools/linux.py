@@ -112,7 +112,7 @@ if args.u_boot:
     boot_addr = uboot_addr
 
 p.cpufreq_init()
-p.smp_start_secondaries()
+#p.smp_start_secondaries()
 
 if args.tso:
     print("Enabling TSO:")

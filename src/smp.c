@@ -95,7 +95,7 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
     if (spin_table[index].flag)
         return;
 
-    printf("Starting CPU %d (%d:%d:%d)... ", index, die, cluster, core);
+    printf("Starting CPU %d (%d:%d:%d)...impl:0x%lx cpu_start_base:0x%lx ",index, die, cluster, core, impl, cpu_start_base);
 
     memset(&spin_table[index], 0, sizeof(struct spin_table));
 
@@ -103,15 +103,21 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
     secondary_stacks[index] = memalign(0x4000, SECONDARY_STACK_SIZE);
     _reset_stack = secondary_stacks[index] + SECONDARY_STACK_SIZE;
 
+    printf("write64 impl: 0x%lx _vextor_start: 0x%p ",impl, _vectors_start);
+
     sysop("dmb sy");
 
     write64(impl, (u64)_vectors_start);
 
     cpu_start_base += die * PMGR_DIE_OFFSET;
 
+    printf("write32: cpu_start_base + 0x4: 0x%lx val: 0x%x ",cpu_start_base + 0x4, 1 << (4 * cluster + core));
+
     // Some kind of system level startup/status bit
     // Without this, IRQs don't work
     write32(cpu_start_base + 0x4, 1 << (4 * cluster + core));
+
+    printf("write32: cpu_start_base + 0x8 + 4 * cluster: 0x%lx val: 0x%x ",cpu_start_base + 0x8 + 4 * cluster, 1 << core);
 
     // Actually start the core
     write32(cpu_start_base + 0x8 + 4 * cluster, 1 << core);
@@ -147,6 +153,7 @@ static void smp_stop_cpu(int index, int die, int cluster, int core, u64 impl, u6
     cpu_start_base += die * PMGR_DIE_OFFSET;
 
     // Request CPU stop
+    printf("Writting @%lx 0x%x\n",cpu_start_base, 1 << (4 * cluster + core));
     write32(cpu_start_base + 0x0, 1 << (4 * cluster + core));
 
     // Put the CPU to sleep
