@@ -392,9 +392,12 @@ void exc_irq(u64 *regs)
 void exc_fiq(u64 *regs)
 {
     u64 spsr = in_gl12() ? mrs(SYS_IMP_APL_SPSR_GL1) : mrs(SPSR_EL1);
-    printf("Exception: FIQ (from %s) cnt: %lx\n", get_exception_source(spsr), mrs(CNTPCT_EL0));
+    printf("Exception: FIQ (from %s) cnt: %lx s2r_sleep_type: 0x%x\n",
+           get_exception_source(spsr), mrs(CNTPCT_EL0), s2r_sleep_type);
 
     u64 reg = mrs(CNTP_CTL_EL0);
+    printf("  CNTP_CTL=0x%lx (EN=%lu IMASK=%lu ISTATUS=%lu) TVAL=%ld\n",
+           reg, reg & 1, (reg >> 1) & 1, (reg >> 2) & 1, (s64)mrs(CNTP_TVAL_EL0));
     if (reg == 0x5) {
         printf("  PHYS timer IRQ, masking\n");
         msr(CNTP_CTL_EL0, 7L);

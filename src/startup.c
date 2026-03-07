@@ -196,6 +196,11 @@ void _start_c(void *boot_args, void *base)
         debug_putc('!');
     }
 
+    /* S2R debug: print context at very first opportunity after UART init */
+    printf("\n[EARLY BOOT] s2r_sleep_type=0x%x LR=%p CNTP_CTL=0x%lx MPIDR=0x%lx\n",
+           s2r_sleep_type, __builtin_return_address(0), mrs(CNTP_CTL_EL0),
+           mrs(MPIDR_EL1));
+
     uart_puts("Initializing");
     get_device_info();
 
