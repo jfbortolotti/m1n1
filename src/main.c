@@ -7,6 +7,10 @@
 
 #include "adt.h"
 #include "aic.h"
+#include "s2r.h"
+#include "smp.h"
+#include "pmgr.h"
+#include "sep.h"
 #include "cpufreq.h"
 #include "display.h"
 #include "exception.h"
@@ -19,9 +23,6 @@
 #include "nvme.h"
 #include "payload.h"
 #include "pcie.h"
-#include "pmgr.h"
-#include "sep.h"
-#include "smp.h"
 #include "string.h"
 #include "uart.h"
 #include "uartproxy.h"
@@ -180,6 +181,19 @@ void m1n1_main(void)
 #endif
 
     printf("Initialization complete.\n");
+
+    /*
+     * S2R standalone test — runs automatically without proxy client.
+     * Force framebuffer active so output is visible on screen.
+     * Comment out or remove once testing is done.
+     */
+#ifdef USE_FB
+    fb_set_active(true);
+#endif
+    printf("\n*** Starting standalone S2R test ***\n\n");
+    smp_start_secondaries();
+    int s2r_ret = s2r_test(5000000, 0); /* 1 second sleep, no PMIC */
+    printf("S2R test returned: %d\n\n", s2r_ret);
 
     run_actions();
 

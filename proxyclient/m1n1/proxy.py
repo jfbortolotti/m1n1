@@ -644,6 +644,8 @@ class M1N1Proxy(Reloadable):
 
     P_CPUFREQ_INIT = 0x1300
 
+    P_S2R_TEST = 0x1400
+
     def __init__(self, iface, debug=False):
         self.debug = debug
         self.iface = iface
@@ -1145,6 +1147,12 @@ class M1N1Proxy(Reloadable):
 
     def cpufreq_init(self):
         return self.request(self.P_CPUFREQ_INIT)
+
+    def s2r_test(self, sleep_us=1000000, pmic=0):
+        '''Run S2R (suspend to RAM) test.
+        sleep_us: sleep duration in microseconds (default 1s)
+        pmic: 0=skip PMIC, 1=send SPMI sleep/wakeup to PMIC'''
+        return self.request(self.P_S2R_TEST, sleep_us, pmic, signed=True)
 
 __all__.extend(k for k, v in globals().items()
                if (callable(v) or isinstance(v, type)) and v.__module__ == __name__)

@@ -4,6 +4,7 @@
 #include "chickens.h"
 #include "exception.h"
 #include "firmware.h"
+#include "s2r.h"
 #include "smp.h"
 #include "string.h"
 #include "types.h"

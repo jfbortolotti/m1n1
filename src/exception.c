@@ -7,6 +7,7 @@
 #include "gxf.h"
 #include "iodev.h"
 #include "memory.h"
+#include "s2r.h"
 #include "uart.h"
 #include "utils.h"
 

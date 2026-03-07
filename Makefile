@@ -162,6 +162,7 @@ OBJECTS := \
 	sio.o \
 	smc.o \
 	smp.o \
+	s2r.o s2r_asm.o \
 	spmi.o \
 	start.o \
 	startup.o \

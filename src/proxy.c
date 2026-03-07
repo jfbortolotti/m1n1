@@ -2,6 +2,7 @@
 
 #include "proxy.h"
 #include "cpufreq.h"
+#include "s2r.h"
 #include "dapf.h"
 #include "dart.h"
 #include "display.h"
@@ -607,6 +608,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 
         case P_CPUFREQ_INIT:
             reply->retval = cpufreq_init();
+            break;
+
+        case P_S2R_TEST:
+            reply->retval = s2r_test(request->args[0], request->args[1]);
             break;
 
         default:
