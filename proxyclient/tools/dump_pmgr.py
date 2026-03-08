@@ -108,6 +108,8 @@ for clk in range(256):
 
 print()
 
+chip_id = u.adt["/chosen"].chip_id
+
 if chip_id in (0x8960, 0x7000, 0x7001, 0x8000, 0x8001, 0x8003, 0x8010, 0x8012, 0x8015):
     exit(0)
 

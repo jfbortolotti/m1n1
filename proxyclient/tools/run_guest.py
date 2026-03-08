@@ -114,6 +114,11 @@ if args.shell:
 
 hv.start()
 
+print("Disabling all Watchdog as we are exiting hypervisor")
+p.write32(0x23d2b002c,0)
+p.write32(0x23d2b001c,0)
+p.write32(0x23d2b000c,0)
+
 run_shell(hv.shell_locals, "Hypervisor exited. Entering shell.")
 
 p.smp_stop_secondaries(True)
