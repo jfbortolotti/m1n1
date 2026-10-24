@@ -51,4 +51,9 @@ int s2r_test(u32 sleep_us, int pmic);
  */
 int s2r_enter(void *ctx);
 
+/*
+* util function to wait on timer polling
+*/
+void wait_loop(u32 sleep_us);
+
 #endif

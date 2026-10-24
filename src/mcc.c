@@ -206,7 +206,7 @@ int mcc_unmap_carveouts(void)
             end = (end + 1) << 12;
             start |= ram_base;
             end |= ram_base;
-            printf("MMU: Unmapping TZ%d region at 0x%lx..0x%lx\n", i, start, end);
+            //printf("MMU: Unmapping TZ%d region at 0x%lx..0x%lx\n", i, start, end);
             mmu_rm_mapping(start, end - start);
             mmu_rm_mapping(start | REGION_RWX_EL0, end - start);
             mmu_rm_mapping(start | REGION_RW_EL0, end - start);

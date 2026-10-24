@@ -190,10 +190,21 @@ void m1n1_main(void)
 #ifdef USE_FB
     fb_set_active(true);
 #endif
-    printf("\n*** Starting standalone S2R test ***\n\n");
-    smp_start_secondaries();
-    int s2r_ret = s2r_test(5000000, 0); /* 1 second sleep, no PMIC */
-    printf("S2R test returned: %d\n\n", s2r_ret);
+
+    if (s2r_sleep_type != 3) {
+        wait_loop(10000000);
+        printf("\n*** Starting standalone S2R test ***\n\n");
+        smp_start_secondaries();
+        int s2r_ret = s2r_test(5000000, 0); /* 5 seconds sleep, no PMIC */
+        printf("S2R test returned: %d\n\n", s2r_ret);
+    } else {
+        printf("We are coming back from WFI sleep type : %d\n\n", s2r_sleep_type);
+        wait_loop(10000000);
+        printf("\n*** Starting standalone S2R test ***\n\n");
+        //smp_start_secondaries();
+        int s2r_ret = s2r_test(5000000, 0); /* 5 seconds sleep, no PMIC */
+        printf("S2R test returned: %d\n\n", s2r_ret);
+    }
 
     run_actions();
 

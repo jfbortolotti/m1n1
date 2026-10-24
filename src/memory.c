@@ -330,15 +330,25 @@ static u64 mmu_make_table_pte(u64 *addr)
 
 static void mmu_init_pagetables(void)
 {
-    mmu_pt_L0 = memalign(PAGE_SIZE, sizeof(u64) * ENTRIES_PER_L0_TABLE);
-    mmu_pt_L1 = memalign(PAGE_SIZE, sizeof(u64) * ENTRIES_PER_L1_TABLE);
+//    if (mmu_pt_L0 == NULL) {
+        printf("MMU: mmu_init_pagetables... 1 mmu_pt_L0: %p \n", mmu_pt_L0);
+        mmu_pt_L0 = memalign(PAGE_SIZE, sizeof(u64) * ENTRIES_PER_L0_TABLE);
+        printf("MMU: mmu_init_pagetables... 2 mmu_pt_L1: %p \n", mmu_pt_L1);
+        mmu_pt_L1 = memalign(PAGE_SIZE, sizeof(u64) * ENTRIES_PER_L1_TABLE);
+        printf("MMU: mmu_init_pagetables... 3 mmu_pt_L0: %p mmu_pt_L1: %p \n", mmu_pt_L0, mmu_pt_L1);
+//    } else
+//        printf("MMU: mmu_init_pagetables... 3 mmu_pt_L0: %p mmu_pt_L1: %p \n", mmu_pt_L0, mmu_pt_L1);
 
     memset64(mmu_pt_L0, 0, sizeof(u64) * ENTRIES_PER_L0_TABLE);
+    printf("MMU: mmu_init_pagetables... 4\n");
     memset64(mmu_pt_L1, 0, sizeof(u64) * ENTRIES_PER_L1_TABLE);
+    printf("MMU: mmu_init_pagetables... 5\n");
 
     for (size_t i = 0; i < ENTRIES_PER_L0_TABLE; i++) {
+        printf("MMU: mmu_init_pagetables... 6:%ld\n", i);  
         mmu_pt_L0[i] = mmu_make_table_pte(&mmu_pt_L1[i * ENTRIES_PER_L1_TABLE_ACTUAL]);
     }
+    printf("MMU: mmu_init_pagetables... return\n");
     return;
 }
 
@@ -411,10 +421,10 @@ static void mmu_remap_ranges(void)
 
         // TODO: is this the right logic?
         if ((flags >> 28) == 8) {
-            printf("MMU: Adding Device-nGnRE mapping at 0x%lx (0x%lx)\n", addr, size);
+            //printf("MMU: Adding Device-nGnRE mapping at 0x%lx (0x%lx)\n", addr, size);
             mmu_add_mapping(addr, addr, size, MAIR_IDX_DEVICE_nGnRE, PERM_RW_EL0);
         } else if (flags == 0x60004016) {
-            printf("MMU: Adding Normal-NC mapping at 0x%lx (0x%lx)\n", addr, size);
+            //printf("MMU: Adding Normal-NC mapping at 0x%lx (0x%lx)\n", addr, size);
             mmu_add_mapping(addr, addr, size, MAIR_IDX_NORMAL_NC, PERM_RW_EL0);
         }
 
@@ -530,14 +540,21 @@ void mmu_init(void)
 {
     printf("MMU: Initializing...\n");
 
+
     if (read_sctlr() & SCTLR_M) {
         printf("MMU: already initialized.\n");
         return;
     }
 
+    printf("MMU: mmu_init_pagetables...\n");
     mmu_init_pagetables();
+
+    printf("MMU: mmu_add_default_mappings...\n");
     mmu_add_default_mappings();
+    
+    printf("MMU: mmu_configure...\n");
     mmu_configure();
+    printf("MMU: mmu_init_sprr...\n");
     if (cpu_features->mmu_sprr)
         mmu_init_sprr();
 
@@ -545,6 +562,7 @@ void mmu_init(void)
     if (supports_pan())
         msr(PAN, 0);
 
+    printf("MMU: sctlr setup\n");
     // RES1 bits
     u64 sctlr = SCTLR_LSMAOE | SCTLR_nTLSMD | SCTLR_TSCXT | SCTLR_ITD;
     // Configure translation

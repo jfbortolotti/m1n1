@@ -31,7 +31,8 @@
 /* ------------------------------------------------------------------ */
 
 /* Debug context: set before each sleep entry, read in exc_fiq and early boot */
-volatile u32 s2r_sleep_type = 0xFF;
+volatile u32 s2r_sleep_type = 0xFFFFFFFF;
+static u32 s2r_sleep_count = 0x0;
 /*  Diagnostic helpers                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -216,8 +217,10 @@ static int test_level2_deep_wfi_retention(u32 sleep_us)
 
     /* Same CYC_OVRD config as deep_wfi() — this is known to work */
     if (cpu_features->cyc_ovrd) {
-        cyc_ovrd_saved = mrs(SYS_IMP_APL_CYC_OVRD);
-        msr(SYS_IMP_APL_CYC_OVRD, cyc_ovrd_saved | CYC_OVRD_WFI_MODE(3));
+        //cyc_ovrd_saved = mrs(SYS_IMP_APL_CYC_OVRD);
+        //msr(SYS_IMP_APL_CYC_OVRD, cyc_ovrd_saved | CYC_OVRD_WFI_MODE(3));
+        reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK|CYC_OVRD_DISABLE_WFI_RET,
+                 CYC_OVRD_WFI_MODE(3));
         printf("  Set CYC_OVRD WFI_MODE=3 (deep WFI retention)\n");
         printf("    CYC_OVRD now = 0x%lx\n", mrs(SYS_IMP_APL_CYC_OVRD));
     }
@@ -321,6 +324,27 @@ static int test_level3_acc_no_deep_sleep(u32 sleep_us)
     return 0;
 }
 
+void wait_loop(u32 sleep_us)
+{
+    printf("\n--- Wait loop timer polling ---\n");
+
+    //dump_timer_state("before");
+    setup_timer(sleep_us);
+    //dump_timer_state("armed");
+
+    u64 t0 = mrs(CNTPCT_EL0);
+    poll_timer_expiry(sleep_us * 3);
+    u64 t1 = mrs(CNTPCT_EL0);
+
+    u64 elapsed_us = ((t1 - t0) * 1000000) / mrs(CNTFRQ_EL0);
+    printf("  Elapsed: %lu us (expected ~%u us)\n", elapsed_us, sleep_us);
+
+    /* Disable timer */
+    msr(CNTP_CTL_EL0, 0);
+    sysop("isb");
+
+}
+
 /* ------------------------------------------------------------------ */
 /*  Main entry point                                                   */
 /* ------------------------------------------------------------------ */
@@ -337,16 +361,21 @@ int s2r_test(u32 sleep_us, int pmic)
     printf("  PMIC: %s\n", pmic ? "enabled" : "disabled");
     printf("  Timer freq: %lu Hz\n", mrs(CNTFRQ_EL0));
     printf("  Sleep mode: %d\n", cpu_features->sleep_mode);
+    printf("  Sleep count: %d\n", s2r_sleep_count);
     printf("  EL%lu, CPU %d\n", mrs(CurrentEL) >> 2, boot_cpu_idx);
     printf("  Arch retention: %s\n", supports_arch_retention() ? "yes" : "no");
     printf("\n");
+
+
+    wait_loop(10000000);
 
     /* Dump initial state */
     dump_cpu_sleep_state("init");
     dump_timer_state("init");
 
+//#if 1
     /* Level 0: Verify timer works at all (no WFI) */
-    ret = test_level0_timer_sanity(sleep_us < 100000 ? sleep_us : 100000);
+    ret = test_level0_timer_sanity(sleep_us);
     if (ret < 0) {
         printf("\nABORT: Timer doesn't work, cannot proceed.\n");
         return -1;
@@ -365,8 +394,9 @@ int s2r_test(u32 sleep_us, int pmic)
         printf("\nABORT: Deep WFI retention failed.\n");
         return -1;
     }
-
+//#endif
     /* Level 3: ACC overrides without DEEP_SLEEP */
+    s2r_sleep_count +=1;
     ret = test_level3_acc_no_deep_sleep(sleep_us);
     if (ret < 0) {
         printf("\nABORT: ACC override test failed.\n");

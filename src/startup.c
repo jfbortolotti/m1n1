@@ -11,6 +11,9 @@
 #include "uart.h"
 #include "utils.h"
 #include "xnuboot.h"
+#include "mcc.h"
+#include "memory.h"
+
 
 u64 boot_args_addr;
 struct boot_args cur_boot_args;
@@ -214,12 +217,29 @@ void _start_c(void *boot_args, void *base)
     printf("\n");
 
     exception_initialize();
+
+    /* S2R debug: print context at very first opportunity after UART init */
+    printf("\n[EARLY BOOT] s2r_sleep_type=0x%x LR=%p CNTP_CTL=0x%lx MPIDR=0x%lx\n",
+           s2r_sleep_type, __builtin_return_address(0), mrs(CNTP_CTL_EL0),
+           mrs(MPIDR_EL1));
+
     m1n1_main();
+}
+
+static inline void write_sctlr(u64 val)
+{
+    msr(SCTLR_EL1, val);
+    sysop("isb");
 }
 
 /* Secondary SMP core boot */
 void _cpu_reset_c(void *stack)
 {
+
+
+ //   mcc_init();
+    // mmu_init();
+
     if (!is_boot_cpu())
         uart_puts("RVBAR entry on secondary CPU");
     else
@@ -241,6 +261,7 @@ void _cpu_reset_c(void *stack)
         smp_secondary_prep_el3();
         return;
     }
+
 
     if (!is_boot_cpu())
         smp_secondary_entry();

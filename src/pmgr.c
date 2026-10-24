@@ -437,8 +437,9 @@ int pmgr_init(void)
 
                         if (!(reg & PMGR_AUTO_ENABLE) &&
                             FIELD_GET(PMGR_PS_TARGET, reg) != PMGR_PS_ACTIVE) {
-                            printf("pmgr: Enabling %d.%s, parent of active device %s\n", die,
+                            /*printf("pmgr: Enabling %d.%s, parent of active device %s\n", die,
                                    pdevice->name, device->name);
+                            */
                             pmgr_set_mode(addr, PMGR_PS_ACTIVE);
                         }
                     }
