@@ -237,6 +237,9 @@ extern void mmu_secondary_setup(void);
 
 void _cpu_reset_c(void *stack)
 {
+    /* Keep it in a register: stores are only safe once the MMU is back on */
+    u64 s2r_entry_ts = mrs(CNTPCT_EL0);
+
     s2r_crumb(1);
 
     if (!is_boot_cpu())
@@ -261,6 +264,7 @@ void _cpu_reset_c(void *stack)
     if (is_boot_cpu() && s2r_ctx.magic == S2R_CTX_MAGIC) {
         printf("  S2R: valid context found, resuming after s2r_enter\n");
         mmu_secondary_setup();
+        s2r_ts.reset_entry = s2r_entry_ts;
         s2r_crumb(4);
         s2r_restore();
     }

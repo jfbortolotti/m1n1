@@ -55,6 +55,15 @@ extern struct s2r_ctx s2r_ctx;
 
 void s2r_flush(void);
 
+/* Raw CNTPCT timestamps used to work out who woke the core (level 4) */
+struct s2r_timestamps {
+    u64 reset_entry; /* top of _cpu_reset_c on the resuming core */
+    u64 waker_start; /* waker core started running */
+    u64 waker_ipi;   /* waker sent the IPI */
+    u64 waker_pmgr;  /* waker did the PMGR start write */
+};
+extern volatile struct s2r_timestamps s2r_ts;
+
 /*
  * On-screen breadcrumbs for debugging the reset-vector resume without UART:
  * s2r_crumb(n) lights the n-th white square along the bottom of the screen

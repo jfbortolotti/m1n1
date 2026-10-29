@@ -53,6 +53,13 @@ bool smp_wake_prepare(int cpu);
 void smp_wake_stop_request(void);
 void smp_wake_start(void);
 
+/*
+ * Restart secondary cores that are marked alive but no longer answer (e.g.
+ * powered down with their cluster by a deep-sleep override). Returns the
+ * number of cores restarted.
+ */
+int smp_restart_unresponsive(void);
+
 static inline int smp_id(void)
 {
     if (in_el3())

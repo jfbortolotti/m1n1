@@ -420,10 +420,13 @@ static struct {
     u64 impl, base;
 } wake_info;
 
-bool smp_wake_prepare(int cpu)
-{
-    wake_info.valid = false;
+struct cpu_pmgr_info {
+    int die, cluster, core;
+    u64 impl, base;
+};
 
+static bool get_cpu_pmgr_info(int cpu, struct cpu_pmgr_info *out)
+{
     if (cpu < 0 || cpu >= MAX_CPUS || !cpu_nodes[cpu] || !pmgr_reg || !cpu_start_off)
         return false;
 
@@ -445,11 +448,28 @@ bool smp_wake_prepare(int cpu)
         memcpy(cpu_impl_reg, &regs[index], 16);
     }
 
-    wake_info.core = FIELD_GET(CPU_REG_CORE, reg);
-    wake_info.cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
-    wake_info.die = FIELD_GET(CPU_REG_DIE, reg);
-    wake_info.impl = cpu_impl_reg[0];
-    wake_info.base = pmgr_reg + cpu_start_off + wake_info.die * PMGR_DIE_OFFSET;
+    out->core = FIELD_GET(CPU_REG_CORE, reg);
+    out->cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
+    out->die = FIELD_GET(CPU_REG_DIE, reg);
+    out->impl = cpu_impl_reg[0];
+    out->base = pmgr_reg + cpu_start_off + out->die * PMGR_DIE_OFFSET;
+    return true;
+}
+
+bool smp_wake_prepare(int cpu)
+{
+    struct cpu_pmgr_info info;
+
+    wake_info.valid = false;
+
+    if (!get_cpu_pmgr_info(cpu, &info))
+        return false;
+
+    wake_info.core = info.core;
+    wake_info.cluster = info.cluster;
+    wake_info.die = info.die;
+    wake_info.impl = info.impl;
+    wake_info.base = info.base;
 
     u64 rvbar = read64(wake_info.impl);
     printf("S2R wake: cpu %d (%d:%d:%d) impl=0x%lx RVBAR=0x%lx%s cpu_start=0x%lx\n", cpu,
@@ -464,6 +484,41 @@ bool smp_wake_prepare(int cpu)
 
     wake_info.valid = true;
     return true;
+}
+
+static u64 smp_ping(u64 a, u64 b, u64 c, u64 d)
+{
+    UNUSED(a);
+    UNUSED(b);
+    UNUSED(c);
+    UNUSED(d);
+    return 0;
+}
+
+int smp_restart_unresponsive(void)
+{
+    int restarted = 0;
+
+    for (int i = 0; i < MAX_CPUS; i++) {
+        struct cpu_pmgr_info info;
+
+        if (i == boot_cpu_idx || !spin_table[i].flag)
+            continue;
+        if (smp_call4_timeout(i, smp_ping, 0, 0, 0, 0, 200000)) {
+            smp_wait(i);
+            continue;
+        }
+        if (!get_cpu_pmgr_info(i, &info))
+            continue;
+
+        printf("S2R: restarting unresponsive CPU %d\n", i);
+        memset(&spin_table[i], 0, sizeof(struct spin_table));
+        smp_start_cpu(i, info.die, info.cluster, info.core, info.impl, pmgr_reg + cpu_start_off);
+        if (spin_table[i].flag)
+            restarted++;
+    }
+
+    return restarted;
 }
 
 void smp_wake_stop_request(void)

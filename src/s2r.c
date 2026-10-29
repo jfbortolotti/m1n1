@@ -406,9 +406,11 @@ static u64 s2r_ping(u64 a, u64 b, u64 c, u64 d)
     return 0;
 }
 
-/* Check that a secondary core still answers; returns its index or -1 */
+/* Ping every secondary and print the result; returns the first responsive one or -1 */
 static int s2r_check_secondary(const char *when)
 {
+    int first = -1;
+
     for (int i = 0; i < MAX_CPUS; i++) {
         if (i == boot_cpu_idx || !smp_is_alive(i))
             continue;
@@ -416,11 +418,13 @@ static int s2r_check_secondary(const char *when)
         printf("  [%s] secondary CPU %d: %s\n", when, i, ok ? "responds" : "NO RESPONSE");
         if (ok) {
             smp_wait(i);
-            return i;
+            if (first < 0)
+                first = i;
         }
     }
-    printf("  [%s] no responsive secondary CPU\n", when);
-    return -1;
+    if (first < 0)
+        printf("  [%s] no responsive secondary CPU\n", when);
+    return first;
 }
 
 /* ------------------------------------------------------------------ */
@@ -428,6 +432,22 @@ static int s2r_check_secondary(const char *when)
 /* ------------------------------------------------------------------ */
 
 #define S2R_WDT_MARGIN_MS 15000
+
+/* Delay between the waker's IPI and its PMGR start write (timer/IPI never woke the core) */
+#define S2R_ESCALATE_US 100000
+
+volatile struct s2r_timestamps s2r_ts;
+
+/*
+ * Level 4 experiment selector (build with: touch src/s2r.c; make EXTRA_CFLAGS=-DS2R_L4_MODE=n):
+ *   0 = timer + PMGR stop request + waker core (IPI, then PMGR start)
+ *   1 = waker only: timer disarmed, PMGR stop request, waker (IPI, then PMGR start)
+ *   2 = timer + waker, but no PMGR stop request
+ * (Timer alone, with or without the stop request, never woke the core: see log timestamps.)
+ */
+#ifndef S2R_L4_MODE
+#define S2R_L4_MODE 0
+#endif
 
 /* Set by the boot core once it is back, so the waker knows to stop escalating */
 static volatile u32 s2r_woke;
@@ -441,11 +461,13 @@ static u64 s2r_waker(u64 delay_us, u64 escalate_us, u64 unused2, u64 unused3)
     UNUSED(unused2);
     UNUSED(unused3);
 
+    s2r_ts.waker_start = mrs(CNTPCT_EL0);
     s2r_crumb(12);
     udelay(delay_us);
     if (s2r_woke)
         return 0;
 
+    s2r_ts.waker_ipi = mrs(CNTPCT_EL0);
     smp_send_ipi(boot_cpu_idx);
     s2r_crumb(7);
 
@@ -453,6 +475,7 @@ static u64 s2r_waker(u64 delay_us, u64 escalate_us, u64 unused2, u64 unused3)
     if (s2r_woke)
         return 1;
 
+    s2r_ts.waker_pmgr = mrs(CNTPCT_EL0);
     smp_wake_start();
     s2r_crumb(8);
     return 2;
@@ -521,7 +544,9 @@ static int test_level4_deep_sleep(u32 sleep_us)
         return 0;
     }
 
+    printf("  Level 4 mode: %d\n", S2R_L4_MODE);
     dump_cpu_sleep_state("before");
+    s2r_check_secondary("level4 before ACC_OVRD");
 
     if (in_el2())
         reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
@@ -542,10 +567,14 @@ static int test_level4_deep_sleep(u32 sleep_us)
     }
 
     setup_timer(sleep_us);
+    if (S2R_L4_MODE == 1) {
+        msr(CNTP_CTL_EL0, 0); /* no timer wake: only the waker can wake us */
+        sysop("isb");
+    }
     snapshot_regs();
 
     /* Pick a responsive secondary to wake the boot core from outside */
-    int waker = s2r_check_secondary("level4");
+    int waker = s2r_check_secondary("level4 after ACC_OVRD");
     if (waker >= 0 && !smp_wake_prepare(boot_cpu_idx))
         waker = -1;
     printf("  Waker CPU: %d (boot CPU %d)\n", waker, boot_cpu_idx);
@@ -566,14 +595,19 @@ static int test_level4_deep_sleep(u32 sleep_us)
     s2r_crumb(0);
 
     s2r_woke = 0;
+    s2r_ts.reset_entry = s2r_ts.waker_start = s2r_ts.waker_ipi = s2r_ts.waker_pmgr = 0;
     if (waker >= 0) {
-        if (!smp_call4_timeout(waker, s2r_waker, sleep_us, 1000000, 0, 0, 200000))
+        if (!smp_call4_timeout(waker, s2r_waker, sleep_us, S2R_ESCALATE_US, 0, 0, 200000))
             waker = -1;
-        if (waker >= 0) {
+        if (waker >= 0)
             s2r_crumb(10);
-            smp_wake_stop_request();
-            s2r_crumb(11);
-        }
+    }
+    if (S2R_L4_MODE != 2) {
+        /* PMGR stop request; needs wake_info: prepare it even without a waker */
+        if (waker < 0)
+            smp_wake_prepare(boot_cpu_idx);
+        smp_wake_stop_request();
+        s2r_crumb(11);
     }
 
     u64 t0 = mrs(CNTPCT_EL0);
@@ -591,6 +625,17 @@ static int test_level4_deep_sleep(u32 sleep_us)
     s2r_crumb_disable(); /* keep squares on screen for a few seconds, then restore the console */
     printf("  Woke up! (s2r_enter_deep returned %d)\n", wake_ret);
 
+    {
+        u64 f = mrs(CNTFRQ_EL0);
+#define TS_US(v) ((v) ? (long)((((s64)(v) - (s64)t0) * 1000000) / (s64)f) : -1L)
+        printf("  Timestamps (us since sleep entry, -1 = not reached):\n");
+        printf("    core back at reset vector : %ld\n", TS_US(s2r_ts.reset_entry));
+        printf("    waker started             : %ld\n", TS_US(s2r_ts.waker_start));
+        printf("    waker sent IPI            : %ld\n", TS_US(s2r_ts.waker_ipi));
+        printf("    waker did PMGR start      : %ld\n", TS_US(s2r_ts.waker_pmgr));
+#undef TS_US
+    }
+
     compare_regs_with_snapshot();
     dump_cpu_sleep_state("after");
 
@@ -605,6 +650,11 @@ static int test_level4_deep_sleep(u32 sleep_us)
 
     msr(CNTP_CTL_EL0, 0);
     sysop("isb");
+
+    /* Cores that went down with the cluster are still marked alive: bring them back */
+    int restarted = smp_restart_unresponsive();
+    printf("  Restarted %d unresponsive secondary CPU(s)\n", restarted);
+    s2r_check_secondary("level4 end");
 
     printf("  Level 4: PASS\n");
     return 0;
