@@ -42,3 +42,22 @@ void wdt_reboot(void)
     write32(wdt_base + WDT_COUNT, 0);
     write32(wdt_base + WDT_CTL, 4);
 }
+
+/* WDT counts at the 24 MHz system counter rate */
+void wdt_arm(u32 timeout_ms)
+{
+    if (!wdt_base)
+        return;
+
+    write32(wdt_base + WDT_COUNT, 0);
+    write32(wdt_base + WDT_ALARM, timeout_ms * 24000);
+    write32(wdt_base + WDT_CTL, 4);
+}
+
+void wdt_stop(void)
+{
+    if (!wdt_base)
+        return;
+
+    write32(wdt_base + WDT_CTL, 0);
+}

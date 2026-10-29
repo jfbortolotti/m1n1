@@ -10,7 +10,9 @@
 #include "spmi.h"
 #include "string.h"
 #include "types.h"
+#include "fb.h"
 #include "utils.h"
+#include "wdt.h"
 
 /*
  * S2R test for Apple Silicon (M1).
@@ -44,6 +46,65 @@ void s2r_flush(void)
     dcsw_op_all(DCSW_OP_DCCSW);
     sysop("dsb sy");
 }
+
+/* Breadcrumb state; filled before sleep so it is cleaned to memory by s2r_flush */
+static struct {
+    volatile u32 *base;
+    u32 stride, width, height;
+} s2r_crumb_info;
+
+#define CRUMB_SIZE 40
+#define CRUMB_PITCH 56
+
+static void crumb_fill(int stage, u32 color)
+{
+    if (!s2r_crumb_info.base)
+        return;
+
+    u32 x0 = 16 + stage * CRUMB_PITCH;
+    u32 y0 = s2r_crumb_info.height - CRUMB_SIZE - 16;
+
+    if (x0 + CRUMB_SIZE > s2r_crumb_info.width)
+        return;
+
+    for (u32 y = 0; y < CRUMB_SIZE; y++) {
+        volatile u32 *row = &s2r_crumb_info.base[(y0 + y) * s2r_crumb_info.stride + x0];
+        for (u32 x = 0; x < CRUMB_SIZE; x++)
+            row[x] = color;
+        /* make sure the pixels reach the display's view of DRAM even if cached */
+        dc_civac_range((void *)row, CRUMB_SIZE * 4);
+    }
+    sysop("dsb sy");
+}
+
+void s2r_crumb_init(void)
+{
+    if (!fb.hwptr)
+        return;
+
+    s2r_crumb_info.stride = fb.stride;
+    s2r_crumb_info.width = fb.width;
+    s2r_crumb_info.height = fb.height;
+    s2r_crumb_info.base = fb.hwptr;
+
+    fb_set_active(false);
+
+    for (int i = 0; i < 16; i++)
+        crumb_fill(i, 0);
+}
+
+void s2r_crumb(int stage)
+{
+    crumb_fill(stage, 0xffffffff);
+}
+
+void s2r_crumb_disable(void)
+{
+    s2r_crumb_info.base = NULL;
+    wait_loop(5000000);
+    fb_set_active(true);
+}
+
 static u32 s2r_sleep_count = 0x0;
 /*  Diagnostic helpers                                                 */
 /* ------------------------------------------------------------------ */
@@ -336,6 +397,219 @@ static int test_level3_acc_no_deep_sleep(u32 sleep_us)
     return 0;
 }
 
+static u64 s2r_ping(u64 a, u64 b, u64 c, u64 d)
+{
+    UNUSED(a);
+    UNUSED(b);
+    UNUSED(c);
+    UNUSED(d);
+    return 0;
+}
+
+/* Check that a secondary core still answers; returns its index or -1 */
+static int s2r_check_secondary(const char *when)
+{
+    for (int i = 0; i < MAX_CPUS; i++) {
+        if (i == boot_cpu_idx || !smp_is_alive(i))
+            continue;
+        bool ok = smp_call4_timeout(i, s2r_ping, 0, 0, 0, 0, 200000);
+        printf("  [%s] secondary CPU %d: %s\n", when, i, ok ? "responds" : "NO RESPONSE");
+        if (ok) {
+            smp_wait(i);
+            return i;
+        }
+    }
+    printf("  [%s] no responsive secondary CPU\n", when);
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Level 4: ACC overrides WITH DEEP_SLEEP (power-gate)                */
+/* ------------------------------------------------------------------ */
+
+#define S2R_WDT_MARGIN_MS 15000
+
+/* Set by the boot core once it is back, so the waker knows to stop escalating */
+static volatile u32 s2r_woke;
+
+/*
+ * Runs on a secondary core while the boot core is power-gated. No printf here.
+ *   crumb 7 = IPI sent, crumb 8 = PMGR start written
+ */
+static u64 s2r_waker(u64 delay_us, u64 escalate_us, u64 unused2, u64 unused3)
+{
+    UNUSED(unused2);
+    UNUSED(unused3);
+
+    s2r_crumb(12);
+    udelay(delay_us);
+    if (s2r_woke)
+        return 0;
+
+    smp_send_ipi(boot_cpu_idx);
+    s2r_crumb(7);
+
+    udelay(escalate_us);
+    if (s2r_woke)
+        return 1;
+
+    smp_wake_start();
+    s2r_crumb(8);
+    return 2;
+}
+
+struct s2r_regsnap {
+    const char *name;
+    u64 val;
+};
+
+#define SNAP_REGS(X)                                                                     \
+    X(HCR_EL2) X(SCTLR_EL1) X(TCR_EL1) X(MAIR_EL1) X(TTBR0_EL1) X(VBAR_EL1) X(TPIDR_EL2) \
+    X(CPACR_EL1) X(CNTFRQ_EL0) X(CNTP_CTL_EL0) X(DAIF)
+
+#define SNAP_COUNT_ONE(r) +1
+enum { SNAP_N = 0 SNAP_REGS(SNAP_COUNT_ONE) + 4 };
+
+static struct s2r_regsnap s2r_snap[SNAP_N];
+
+static void snapshot_regs(void)
+{
+    int i = 0;
+#define SNAP_ONE(r)                \
+    s2r_snap[i].name = #r;         \
+    s2r_snap[i++].val = mrs(r);
+    SNAP_REGS(SNAP_ONE)
+#undef SNAP_ONE
+    s2r_snap[i].name = "ACC_OVRD";
+    s2r_snap[i++].val = mrs(SYS_IMP_APL_ACC_OVRD);
+    s2r_snap[i].name = "CYC_OVRD";
+    s2r_snap[i++].val = cpu_features->cyc_ovrd ? mrs(SYS_IMP_APL_CYC_OVRD) : 0;
+    s2r_snap[i].name = "VM_TMR_FIQ_ENA_EL2";
+    s2r_snap[i++].val = in_el2() ? mrs(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2) : 0;
+    s2r_snap[i].name = "CurrentEL";
+    s2r_snap[i++].val = mrs(CurrentEL);
+}
+
+/* Compare current register values against the snapshot taken before sleep */
+static void compare_regs_with_snapshot(void)
+{
+    static struct s2r_regsnap saved[SNAP_N];
+    int diffs = 0;
+
+    memcpy(saved, s2r_snap, sizeof(saved));
+    snapshot_regs();
+
+    for (int i = 0; i < SNAP_N; i++) {
+        if (saved[i].val != s2r_snap[i].val) {
+            printf("    DIFF %-20s before=0x%lx after=0x%lx\n", saved[i].name, saved[i].val,
+                   s2r_snap[i].val);
+            diffs++;
+        }
+    }
+    printf("  Register compare: %d difference(s) out of %d\n", diffs, SNAP_N);
+}
+
+static int test_level4_deep_sleep(u32 sleep_us)
+{
+    printf("\n--- Level 4: ACC overrides + DEEP_SLEEP (power-gate) ---\n");
+
+    u64 cyc_ovrd_saved = 0;
+    u64 acc_ovrd_saved = mrs(SYS_IMP_APL_ACC_OVRD);
+
+    if (cpu_features->sleep_mode != SLEEP_GLOBAL) {
+        printf("  Level 4 only implemented for SLEEP_GLOBAL, skipping\n");
+        return 0;
+    }
+
+    dump_cpu_sleep_state("before");
+
+    if (in_el2())
+        reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+
+    reg_mask(SYS_IMP_APL_ACC_OVRD, ACC_OVRD_DIS_L2_FLUSH_ACC_SLEEP_MASK,
+             ACC_OVRD_PWR_DN_SRM(3) | ACC_OVRD_DIS_L2_FLUSH_ACC_SLEEP(2) |
+                 ACC_OVRD_TRAIN_DOWN_LINK(3) | ACC_OVRD_POWER_DOWN_CPM(3) |
+                 ACC_OVRD_DISABLE_PIO_ON_WFI_CPU | ACC_OVRD_DEEP_SLEEP);
+    printf("  Set ACC_OVRD (with DEEP_SLEEP)\n");
+    printf("    ACC_OVRD now = 0x%lx\n", mrs(SYS_IMP_APL_ACC_OVRD));
+
+    if (cpu_features->cyc_ovrd) {
+        cyc_ovrd_saved = mrs(SYS_IMP_APL_CYC_OVRD);
+        reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK,
+                 CYC_OVRD_WFI_MODE(3) | CYC_OVRD_DISABLE_WFI_RET);
+        printf("  Set CYC_OVRD (deep WFI, no retention)\n");
+        printf("    CYC_OVRD now = 0x%lx\n", mrs(SYS_IMP_APL_CYC_OVRD));
+    }
+
+    setup_timer(sleep_us);
+    snapshot_regs();
+
+    /* Pick a responsive secondary to wake the boot core from outside */
+    int waker = s2r_check_secondary("level4");
+    if (waker >= 0 && !smp_wake_prepare(boot_cpu_idx))
+        waker = -1;
+    printf("  Waker CPU: %d (boot CPU %d)\n", waker, boot_cpu_idx);
+
+    /* Safety net: reset the SoC if the wake or the resume never happens */
+    wdt_arm(sleep_us / 1000 + S2R_WDT_MARGIN_MS);
+
+    s2r_sleep_type = 4;
+    printf("  s2r_sleep_type set to 0x%x\n", s2r_sleep_type);
+    printf("  Entering WFI with DEEP_SLEEP...\n");
+
+    /*
+     * Every console write calls fb_update(), which copies the whole shadow
+     * framebuffer over the hardware one and would wipe the squares. Silence
+     * the console while the breadcrumbs are in use.
+     */
+    s2r_crumb_init();
+    s2r_crumb(0);
+
+    s2r_woke = 0;
+    if (waker >= 0) {
+        if (!smp_call4_timeout(waker, s2r_waker, sleep_us, 1000000, 0, 0, 200000))
+            waker = -1;
+        if (waker >= 0) {
+            s2r_crumb(10);
+            smp_wake_stop_request();
+            s2r_crumb(11);
+        }
+    }
+
+    u64 t0 = mrs(CNTPCT_EL0);
+
+    int wake_ret = s2r_enter_deep((void *)0);
+
+    u64 t1 = mrs(CNTPCT_EL0);
+    s2r_woke = 1;
+    if (cpu_features->fast_ipi)
+        msr(SYS_IMP_APL_IPI_SR_EL1, 1); /* ack a pending wake IPI */
+    wdt_stop();
+    s2r_crumb(6);
+    if (waker >= 0)
+        smp_wait(waker);
+    s2r_crumb_disable(); /* keep squares on screen for a few seconds, then restore the console */
+    printf("  Woke up! (s2r_enter_deep returned %d)\n", wake_ret);
+
+    compare_regs_with_snapshot();
+    dump_cpu_sleep_state("after");
+
+    /* Restore */
+    if (cpu_features->cyc_ovrd)
+        msr(SYS_IMP_APL_CYC_OVRD, cyc_ovrd_saved);
+    msr(SYS_IMP_APL_ACC_OVRD, acc_ovrd_saved);
+    sysop("isb");
+
+    u64 elapsed_us = ((t1 - t0) * 1000000) / mrs(CNTFRQ_EL0);
+    printf("  Elapsed: %lu us (expected ~%u us)\n", elapsed_us, sleep_us);
+
+    msr(CNTP_CTL_EL0, 0);
+    sysop("isb");
+
+    printf("  Level 4: PASS\n");
+    return 0;
+}
+
 void wait_loop(u32 sleep_us)
 {
     printf("\n--- Wait loop timer polling ---\n");
@@ -381,6 +655,8 @@ int s2r_test(u32 sleep_us, int pmic)
 
     wait_loop(10000000);
 
+    s2r_check_secondary("start");
+
     /* Dump initial state */
     dump_cpu_sleep_state("init");
     dump_timer_state("init");
@@ -412,6 +688,16 @@ int s2r_test(u32 sleep_us, int pmic)
     ret = test_level3_acc_no_deep_sleep(sleep_us);
     if (ret < 0) {
         printf("\nABORT: ACC override test failed.\n");
+        return -1;
+    }
+
+    s2r_check_secondary("after level3");
+
+    /* Level 4: ACC overrides with DEEP_SLEEP (power-gate) */
+    s2r_sleep_count += 1;
+    ret = test_level4_deep_sleep(sleep_us);
+    if (ret < 0) {
+        printf("\nABORT: DEEP_SLEEP test failed.\n");
         return -1;
     }
 

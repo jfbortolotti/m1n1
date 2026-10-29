@@ -414,6 +414,74 @@ void smp_stop_secondaries(bool deep_sleep)
     }
 }
 
+static struct {
+    bool valid;
+    int die, cluster, core;
+    u64 impl, base;
+} wake_info;
+
+bool smp_wake_prepare(int cpu)
+{
+    wake_info.valid = false;
+
+    if (cpu < 0 || cpu >= MAX_CPUS || !cpu_nodes[cpu] || !pmgr_reg || !cpu_start_off)
+        return false;
+
+    int arm_io_node = adt_path_offset(adt, "/arm-io");
+    if (arm_io_node < 0)
+        return false;
+
+    int node = cpu_nodes[cpu];
+    u32 reg;
+    u64 cpu_impl_reg[2];
+    if (ADT_GETPROP(adt, node, "reg", &reg) < 0)
+        return false;
+    if (ADT_GETPROP_ARRAY(adt, node, "cpu-impl-reg", cpu_impl_reg) < 0) {
+        u32 reg_len;
+        const u64 *regs = adt_getprop(adt, arm_io_node, "reg", &reg_len);
+        u32 index = 2 * cpu + 2;
+        if (!regs || reg_len < index)
+            return false;
+        memcpy(cpu_impl_reg, &regs[index], 16);
+    }
+
+    wake_info.core = FIELD_GET(CPU_REG_CORE, reg);
+    wake_info.cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
+    wake_info.die = FIELD_GET(CPU_REG_DIE, reg);
+    wake_info.impl = cpu_impl_reg[0];
+    wake_info.base = pmgr_reg + cpu_start_off + wake_info.die * PMGR_DIE_OFFSET;
+
+    u64 rvbar = read64(wake_info.impl);
+    printf("S2R wake: cpu %d (%d:%d:%d) impl=0x%lx RVBAR=0x%lx%s cpu_start=0x%lx\n", cpu,
+           wake_info.die, wake_info.cluster, wake_info.core, wake_info.impl, rvbar,
+           (rvbar & 1) ? " (locked)" : "", wake_info.base);
+    printf("S2R wake: _vectors_start=%p\n", _vectors_start);
+
+    if (!(rvbar & 1)) {
+        write64(wake_info.impl, (u64)_vectors_start);
+        sysop("dmb sy");
+    }
+
+    wake_info.valid = true;
+    return true;
+}
+
+void smp_wake_stop_request(void)
+{
+    if (!wake_info.valid)
+        return;
+    write32(wake_info.base + 0x0, 1 << (4 * wake_info.cluster + wake_info.core));
+}
+
+void smp_wake_start(void)
+{
+    if (!wake_info.valid)
+        return;
+    // Same sequence as smp_start_cpu()
+    write32(wake_info.base + 0x4, 1 << (4 * wake_info.cluster + wake_info.core));
+    write32(wake_info.base + 0x8 + 4 * wake_info.cluster, 1 << wake_info.core);
+}
+
 void smp_send_ipi(int cpu)
 {
     if (cpu >= MAX_CPUS)
@@ -453,6 +521,41 @@ void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 
     while (target->flag == flag)
         sysop("dmb sy");
+}
+
+bool smp_call4_timeout(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
+                       u32 timeout_us)
+{
+    if (cpu >= MAX_CPUS || cpu == boot_cpu_idx)
+        return false;
+
+    struct spin_table *target = &spin_table[cpu];
+
+    u64 flag = target->flag;
+    target->args[0] = arg0;
+    target->args[1] = arg1;
+    target->args[2] = arg2;
+    target->args[3] = arg3;
+    sysop("dmb sy");
+    target->target = (u64)func;
+    sysop("dsb sy");
+
+    if (wfe_mode)
+        sysop("sev");
+    else
+        smp_send_ipi(cpu);
+
+    for (u32 i = 0; i < timeout_us; i += 10) {
+        sysop("dmb sy");
+        if (target->flag != flag)
+            return true;
+        udelay(10);
+    }
+
+    /* Withdraw the request so a late wake does not run it unexpectedly */
+    target->target = 0;
+    sysop("dsb sy");
+    return false;
 }
 
 u64 smp_wait(int cpu)

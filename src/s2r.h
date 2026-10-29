@@ -55,6 +55,22 @@ extern struct s2r_ctx s2r_ctx;
 
 void s2r_flush(void);
 
+/*
+ * On-screen breadcrumbs for debugging the reset-vector resume without UART:
+ * s2r_crumb(n) lights the n-th white square along the bottom of the screen
+ * by writing straight to the physical framebuffer (safe with the MMU off).
+ * No-op until s2r_crumb_init() ran.
+ *
+ *   0 = about to WFI      1 = _cpu_reset_c entered   2 = init_cpu done
+ *   3 = exceptions ready  4 = MMU back on, about to s2r_restore
+ *   6 = s2r_enter_deep returned in the test
+ *   7 = waker sent IPI    8 = waker did PMGR start    10 = smp_call4 to waker returned
+ *   11 = stop request written    12 = waker started running
+ */
+void s2r_crumb_init(void);
+void s2r_crumb(int stage);
+void s2r_crumb_disable(void);
+
 /* Restore saved context and "return 1" from s2r_enter. Does not return. */
 void s2r_restore(void) __attribute__((noreturn));
 

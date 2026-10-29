@@ -237,6 +237,7 @@ extern void mmu_secondary_setup(void);
 
 void _cpu_reset_c(void *stack)
 {
+    s2r_crumb(1);
 
     if (!is_boot_cpu())
         uart_puts("RVBAR entry on secondary CPU");
@@ -246,9 +247,11 @@ void _cpu_reset_c(void *stack)
     printf("\n  Stack base: %p\n", stack);
     printf("  MPIDR: 0x%lx\n", mrs(MPIDR_EL1));
     init_cpu();
+    s2r_crumb(2);
     printf("  Running in EL%lu\n\n", mrs(CurrentEL) >> 2);
 
     exception_initialize();
+    s2r_crumb(3);
 
     /* S2R debug: print context at very first opportunity after UART init */
     printf("\n[EARLY BOOT][cpu_reset] s2r_sleep_type=0x%x LR=%p CNTP_CTL=0x%lx MPIDR=0x%lx\n",
@@ -258,6 +261,7 @@ void _cpu_reset_c(void *stack)
     if (is_boot_cpu() && s2r_ctx.magic == S2R_CTX_MAGIC) {
         printf("  S2R: valid context found, resuming after s2r_enter\n");
         mmu_secondary_setup();
+        s2r_crumb(4);
         s2r_restore();
     }
 

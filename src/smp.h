@@ -26,6 +26,10 @@ void smp_stop_secondaries(bool deep_sleep);
 
 void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
 
+/* Like smp_call4(), but gives up after timeout_us. Returns false on timeout. */
+bool smp_call4_timeout(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
+                       u32 timeout_us);
+
 u64 smp_wait(int cpu);
 
 bool smp_is_alive(int cpu);
@@ -33,6 +37,21 @@ uint64_t smp_get_mpidr(int cpu);
 u64 smp_get_release_addr(int cpu);
 void smp_set_wfe_mode(bool new_mode);
 void smp_send_ipi(int cpu);
+
+/*
+ * Deep-sleep wake helpers (S2R level 4): a core that is power-gated is
+ * restarted by another core through the PMGR CPU-start registers, the same way
+ * smp_start_cpu() starts a secondary.
+ *
+ * smp_wake_prepare:      resolve PMGR/RVBAR registers for @cpu, make RVBAR point to the
+ *                        reset vector (if not locked). Call on a running core, before sleep.
+ * smp_wake_stop_request: set the PMGR "stop" request bit for the prepared cpu
+ *                        (same as smp_stop_cpu() does before cpu_sleep()).
+ * smp_wake_start:        PMGR start write for the prepared cpu. Safe to call from any core.
+ */
+bool smp_wake_prepare(int cpu);
+void smp_wake_stop_request(void);
+void smp_wake_start(void);
 
 static inline int smp_id(void)
 {
