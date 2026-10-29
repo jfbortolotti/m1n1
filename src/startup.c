@@ -200,7 +200,7 @@ void _start_c(void *boot_args, void *base)
     }
 
     /* S2R debug: print context at very first opportunity after UART init */
-    printf("\n[EARLY BOOT] s2r_sleep_type=0x%x LR=%p CNTP_CTL=0x%lx MPIDR=0x%lx\n",
+    printf("\n[EARLY BOOT][start_c][1] s2r_sleep_type=0x%x LR=%p CNTP_CTL=0x%lx MPIDR=0x%lx\n",
            s2r_sleep_type, __builtin_return_address(0), mrs(CNTP_CTL_EL0),
            mrs(MPIDR_EL1));
 
@@ -219,7 +219,7 @@ void _start_c(void *boot_args, void *base)
     exception_initialize();
 
     /* S2R debug: print context at very first opportunity after UART init */
-    printf("\n[EARLY BOOT] s2r_sleep_type=0x%x LR=%p CNTP_CTL=0x%lx MPIDR=0x%lx\n",
+    printf("\n[EARLY BOOT][start_c][2] s2r_sleep_type=0x%x LR=%p CNTP_CTL=0x%lx MPIDR=0x%lx\n",
            s2r_sleep_type, __builtin_return_address(0), mrs(CNTP_CTL_EL0),
            mrs(MPIDR_EL1));
 
@@ -236,10 +236,6 @@ static inline void write_sctlr(u64 val)
 void _cpu_reset_c(void *stack)
 {
 
-
- //   mcc_init();
-    // mmu_init();
-
     if (!is_boot_cpu())
         uart_puts("RVBAR entry on secondary CPU");
     else
@@ -253,7 +249,7 @@ void _cpu_reset_c(void *stack)
     exception_initialize();
 
     /* S2R debug: print context at very first opportunity after UART init */
-    printf("\n[EARLY BOOT] s2r_sleep_type=0x%x LR=%p CNTP_CTL=0x%lx MPIDR=0x%lx\n",
+    printf("\n[EARLY BOOT][cpu_reset] s2r_sleep_type=0x%x LR=%p CNTP_CTL=0x%lx MPIDR=0x%lx\n",
            s2r_sleep_type, __builtin_return_address(0), mrs(CNTP_CTL_EL0),
            mrs(MPIDR_EL1));
 

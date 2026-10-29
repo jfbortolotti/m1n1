@@ -573,7 +573,8 @@ void mmu_init(void)
     printf("MMU: running with MMU and caches enabled!\n");
 }
 
-static void mmu_secondary_setup(void)
+
+void mmu_secondary_setup(void)
 {
     mmu_configure();
     if (cpu_features->mmu_sprr)

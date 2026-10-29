@@ -139,6 +139,8 @@ void run_actions(void)
     uartproxy_run(NULL);
 }
 
+extern void mmu_secondary_setup(void);
+
 void m1n1_main(void)
 {
     printf("\n\nm1n1 %s\n", m1n1_version);
@@ -147,40 +149,49 @@ void m1n1_main(void)
 
     printf("Running in EL%lu\n\n", mrs(CurrentEL) >> 2);
 
-    firmware_init();
+    if (s2r_sleep_type != 3) {
 
-    heapblock_init();
+        firmware_init();
 
-#ifndef BRINGUP
-    if (supports_gxf())
-        gxf_init();
-    mcc_init();
-    mmu_init();
-    aic_init();
-#endif
-    wdt_disable();
-#ifndef BRINGUP
-    pmgr_init();
-#ifdef USE_FB
-    display_init();
-    // Kick DCP to sleep, so dodgy monitors which cause reconnect cycles don't cause us to lose the
-    // framebuffer.
-    display_shutdown(DCP_SLEEP_IF_EXTERNAL);
-    // On idevice we need to always clear, because otherwise it looks scuffed on white devices
-    fb_init(!is_mac);
-    fb_display_logo();
-#ifdef FB_SILENT_MODE
-    fb_set_active(!cur_boot_args.video.display);
-#else
-    fb_set_active(true);
-#endif
-#endif
+        heapblock_init();
 
-    cpufreq_fixup();
-    sep_init();
-#endif
+    #ifndef BRINGUP
+        if (supports_gxf())
+            gxf_init();
+        mcc_init();
+        mmu_init();
+        aic_init();
+    #endif
+        wdt_disable();
+    #ifndef BRINGUP
+        pmgr_init();
+    #ifdef USE_FB
+        display_init();
+        // Kick DCP to sleep, so dodgy monitors which cause reconnect cycles don't cause us to lose the
+        // framebuffer.
+        display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+        // On idevice we need to always clear, because otherwise it looks scuffed on white devices
+        fb_init(!is_mac);
+        fb_display_logo();
 
-    printf("Initialization complete.\n");
+    #ifdef FB_SILENT_MODE
+        fb_set_active(!cur_boot_args.video.display);
+    #else
+        fb_set_active(true);
+    #endif
+    #endif
+
+        cpufreq_fixup();
+        sep_init();
+    #endif
+
+        printf("Initialization complete.\n");
+
+    } else {
+        mmu_secondary_setup();
+        printf("Minimal Initialization complete for cluster restore.\n");
+    }
+    wait_loop(10000000);
 
     /*
      * S2R standalone test — runs automatically without proxy client.
@@ -192,7 +203,7 @@ void m1n1_main(void)
 #endif
 
     if (s2r_sleep_type != 3) {
-        wait_loop(10000000);
+        wait_loop(3000000);
         printf("\n*** Starting standalone S2R test ***\n\n");
         smp_start_secondaries();
         int s2r_ret = s2r_test(5000000, 0); /* 5 seconds sleep, no PMIC */
