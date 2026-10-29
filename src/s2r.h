@@ -42,6 +42,22 @@ extern volatile u32 s2r_sleep_type;
  */
 int s2r_test(u32 sleep_us, int pmic);
 
+#define S2R_CTX_MAGIC 0x53325243545831ULL /* "S2RCTX1" */
+
+/* Saved CPU context for resume after a reset-vector wake (offsets in s2r_asm.S) */
+struct s2r_ctx {
+    u64 magic;
+    u64 sp;
+    u64 tpidr;
+    u64 regs[13]; /* x18..x30 */
+};
+extern struct s2r_ctx s2r_ctx;
+
+void s2r_flush(void);
+
+/* Restore saved context and "return 1" from s2r_enter. Does not return. */
+void s2r_restore(void) __attribute__((noreturn));
+
 /*
  * s2r_enter - assembly WFI with callee-saved register save/restore
  *
@@ -50,6 +66,13 @@ int s2r_test(u32 sleep_us, int pmic);
  * Returns 1 on normal wake (state retained).
  */
 int s2r_enter(void *ctx);
+
+/*
+ * s2r_enter_deep - like s2r_enter, but saves the context in s2r_ctx and
+ * cleans caches so it also returns 1 when the CPU wakes through the reset
+ * vector (resumed by _cpu_reset_c). Used by level 3 and deeper.
+ */
+int s2r_enter_deep(void *ctx);
 
 /*
 * util function to wait on timer polling

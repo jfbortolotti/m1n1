@@ -32,6 +32,18 @@
 
 /* Debug context: set before each sleep entry, read in exc_fiq and early boot */
 volatile u32 s2r_sleep_type = 0xFFFFFFFF;
+
+/* Layout is mirrored by the CTX_* offsets in s2r_asm.S */
+struct s2r_ctx s2r_ctx;
+
+/* Called from s2r_enter_deep: publish the context and clean caches to PoC so a
+ * core coming back from reset (MMU/caches off) sees consistent memory. */
+void s2r_flush(void)
+{
+    s2r_ctx.magic = S2R_CTX_MAGIC;
+    dcsw_op_all(DCSW_OP_DCCSW);
+    sysop("dsb sy");
+}
 static u32 s2r_sleep_count = 0x0;
 /*  Diagnostic helpers                                                 */
 /* ------------------------------------------------------------------ */
@@ -302,10 +314,10 @@ static int test_level3_acc_no_deep_sleep(u32 sleep_us)
     printf("  Entering WFI with ACC overrides...\n");
     u64 t0 = mrs(CNTPCT_EL0);
 
-    int wake_ret = s2r_enter((void *)0);
+    int wake_ret = s2r_enter_deep((void *)0);
 
     u64 t1 = mrs(CNTPCT_EL0);
-    printf("  Woke up! (s2r_enter returned %d)\n", wake_ret);
+    printf("  Woke up! (s2r_enter_deep returned %d)\n", wake_ret);
 
     /* Restore */
     if (cpu_features->cyc_ovrd)

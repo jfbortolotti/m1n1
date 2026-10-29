@@ -233,6 +233,8 @@ static inline void write_sctlr(u64 val)
 }
 
 /* Secondary SMP core boot */
+extern void mmu_secondary_setup(void);
+
 void _cpu_reset_c(void *stack)
 {
 
@@ -252,6 +254,12 @@ void _cpu_reset_c(void *stack)
     printf("\n[EARLY BOOT][cpu_reset] s2r_sleep_type=0x%x LR=%p CNTP_CTL=0x%lx MPIDR=0x%lx\n",
            s2r_sleep_type, __builtin_return_address(0), mrs(CNTP_CTL_EL0),
            mrs(MPIDR_EL1));
+
+    if (is_boot_cpu() && s2r_ctx.magic == S2R_CTX_MAGIC) {
+        printf("  S2R: valid context found, resuming after s2r_enter\n");
+        mmu_secondary_setup();
+        s2r_restore();
+    }
 
     if (in_el3()) {
         smp_secondary_prep_el3();
