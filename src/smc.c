@@ -39,6 +39,9 @@ struct smc_dev {
 
     bool outstanding[SMC_NUM_IDS];
     u64 ret[SMC_NUM_IDS];
+
+    u32 notif_count;
+    u32 last_notif;
 };
 
 static void smc_handle_msg(smc_dev_t *smc, u64 msg)
@@ -49,7 +52,9 @@ static void smc_handle_msg(smc_dev_t *smc, u64 msg)
         u8 result = FIELD_GET(SMC_RESULT_RESULT, msg);
         u8 id = FIELD_GET(SMC_RESULT_ID, msg);
         if (result == SMC_NOTIFICATION) {
-            printf("SMC: Notification: 0x%08lx\n", FIELD_GET(SMC_RESULT_VALUE, msg));
+            smc->last_notif = FIELD_GET(SMC_RESULT_VALUE, msg);
+            smc->notif_count++;
+            printf("SMC: Notification: 0x%08x\n", smc->last_notif);
             return;
         }
         smc->outstanding[id] = false;
@@ -110,6 +115,39 @@ static int smc_cmd(smc_dev_t *smc, u64 message)
     }
 
     return 0;
+}
+
+int smc_poll(smc_dev_t *smc)
+{
+    int handled = 0;
+
+    struct rtkit_message msg;
+
+    /* Never block: rtkit_recv() returns 0 once system messages emptied the mailbox */
+    while (rtkit_can_recv(smc->rtkit)) {
+        int ret = rtkit_recv(smc->rtkit, &msg);
+        printf("SMC: poll recv ret=%d ep=0x%02x msg=0x%016lx\n", ret, ret > 0 ? msg.ep : 0,
+               ret > 0 ? msg.msg : 0);
+        if (ret < 0)
+            break;
+        if (ret == 0)
+            continue;
+        if (msg.ep == SMC_ENDPOINT)
+            smc_handle_msg(smc, msg.msg);
+        handled++;
+    }
+
+    return handled;
+}
+
+u32 smc_notification_count(smc_dev_t *smc)
+{
+    return smc->notif_count;
+}
+
+u32 smc_last_notification(smc_dev_t *smc)
+{
+    return smc->last_notif;
 }
 
 void smc_shutdown(smc_dev_t *smc)
@@ -178,4 +216,20 @@ int smc_write_u32(smc_dev_t *smc, u32 key, u32 value)
     msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
 
     return smc_cmd(smc, msg);
+}
+
+int smc_write_flag(smc_dev_t *smc, u32 key, u8 value)
+{
+    memcpy(smc->shmem, &value, sizeof(value));
+    u64 msg = FIELD_PREP(SMC_MSG_TYPE, SMC_WRITE_KEY);
+    msg |= FIELD_PREP(SMC_WRITE_KEY_SIZE, sizeof(value));
+    msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
+
+    return smc_cmd(smc, msg);
+}
+
+/* Linux (apple_smc_probe) enables SMC notifications by setting the NTAP flag */
+int smc_enable_notifications(smc_dev_t *smc)
+{
+    return smc_write_flag(smc, 0x4e544150 /* 'NTAP' */, 1);
 }

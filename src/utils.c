@@ -6,6 +6,7 @@
 #include "utils.h"
 #include "cpu_regs.h"
 #include "iodev.h"
+#include "s2r.h"
 #include "smp.h"
 #include "types.h"
 #include "utils.h"
@@ -129,6 +130,9 @@ bool timeout_expired(u64 timeout)
 void flush_and_reboot(void)
 {
     iodev_console_flush();
+    /* S2R debug: keep the message readable on the framebuffer before resetting */
+    if (s2r_sleep_type)
+        mdelay(8000);
     reboot();
 }
 

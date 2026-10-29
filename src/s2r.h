@@ -28,6 +28,9 @@
  *   2    = level 2 (deep WFI retention)
  *   3    = level 3 (ACC overrides, no DEEP_SLEEP)
  *   4    = level 4 (full deep sleep with ACC_OVRD_DEEP_SLEEP)
+ *   5    = E2a (SMC button wake, plain WFI)
+ *   6    = E2b (SMC button wake, Level 3 deep WFI)
+ *   7    = E2c (SMC button wake, Level 4 DEEP_SLEEP, no waker core)
  *   0xAA = test complete
  */
 extern volatile u32 s2r_sleep_type;

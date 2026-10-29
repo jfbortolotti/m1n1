@@ -7,6 +7,8 @@
 #include "memory.h"
 #include "pmgr.h"
 #include "smp.h"
+#include "adt.h"
+#include "smc.h"
 #include "spmi.h"
 #include "string.h"
 #include "types.h"
@@ -438,16 +440,63 @@ static int s2r_check_secondary(const char *when)
 
 volatile struct s2r_timestamps s2r_ts;
 
-/*
- * Level 4 experiment selector (build with: touch src/s2r.c; make EXTRA_CFLAGS=-DS2R_L4_MODE=n):
- *   0 = timer + PMGR stop request + waker core (IPI, then PMGR start)
- *   1 = waker only: timer disarmed, PMGR stop request, waker (IPI, then PMGR start)
- *   2 = timer + waker, but no PMGR stop request
- * (Timer alone, with or without the stop request, never woke the core: see log timestamps.)
- */
-#ifndef S2R_L4_MODE
-#define S2R_L4_MODE 0
-#endif
+#define S2R_WD0_IRQ 338 /* t8103.dtsi: wdt interrupts = <AIC_IRQ 338> */
+
+/* Route + unmask the WD0 IRQ to this CPU and arm WD0. Returns false if unsupported. */
+static bool s2r_wd0_irq_setup(u32 timeout_ms)
+{
+    int adt_irq = wdt_wd0_irq_adt();
+    int irq = S2R_WD0_IRQ;
+
+    if (adt_irq >= 0 && adt_irq != irq)
+        printf("  WD0: WARNING ADT first irq %d != assumed %d\n", adt_irq, irq);
+
+    u32 me = aic_whoami();
+    if (!aic_route_irq(irq, BIT(me))) {
+        printf("  WD0: AIC routing unsupported (AIC version != 1?)\n");
+        return false;
+    }
+    printf("  WD0: IRQ %d routed to AIC cpu %u\n", irq, me);
+
+    wdt_wd0_irq_arm(timeout_ms);
+    aic_unmask_irq(irq);
+    return true;
+}
+
+static void s2r_wd0_irq_cleanup(void)
+{
+    wdt_wd0_irq_clear();
+    aic_mask_irq(S2R_WD0_IRQ);
+}
+
+/* E1a: sanity check, plain WFI woken by the WD0 IRQ through the AIC (no deep sleep) */
+static int test_wd0_irq_sanity(u32 sleep_us)
+{
+    printf("\n--- E1a: WD0 IRQ wake from plain WFI ---\n");
+
+    msr(CNTP_CTL_EL0, 0); /* make sure the CPU timer can not be the wake source */
+    sysop("isb");
+
+    if (!s2r_wd0_irq_setup(sleep_us / 1000)) {
+        printf("  E1a: skipped\n");
+        return 0;
+    }
+
+    u64 t0 = mrs(CNTPCT_EL0);
+    wdt_arm(sleep_us / 1000 + 5000); /* safety net */
+    printf("  Entering WFI, expecting 'Exception: IRQ ... num: %d' in ~%u us\n", S2R_WD0_IRQ,
+           sleep_us);
+    int ret = s2r_enter((void *)0);
+    u64 t1 = mrs(CNTPCT_EL0);
+    wdt_stop();
+
+    s2r_wd0_irq_cleanup();
+
+    u64 elapsed_us = ((t1 - t0) * 1000000) / mrs(CNTFRQ_EL0);
+    printf("  Woke up (ret %d) after %lu us (expected ~%u us)\n", ret, elapsed_us, sleep_us);
+    printf("  E1a: PASS if an IRQ exception was printed above\n");
+    return 0;
+}
 
 /* Set by the boot core once it is back, so the waker knows to stop escalating */
 static volatile u32 s2r_woke;
@@ -544,7 +593,6 @@ static int test_level4_deep_sleep(u32 sleep_us)
         return 0;
     }
 
-    printf("  Level 4 mode: %d\n", S2R_L4_MODE);
     dump_cpu_sleep_state("before");
     s2r_check_secondary("level4 before ACC_OVRD");
 
@@ -567,10 +615,6 @@ static int test_level4_deep_sleep(u32 sleep_us)
     }
 
     setup_timer(sleep_us);
-    if (S2R_L4_MODE == 1) {
-        msr(CNTP_CTL_EL0, 0); /* no timer wake: only the waker can wake us */
-        sysop("isb");
-    }
     snapshot_regs();
 
     /* Pick a responsive secondary to wake the boot core from outside */
@@ -578,6 +622,17 @@ static int test_level4_deep_sleep(u32 sleep_us)
     if (waker >= 0 && !smp_wake_prepare(boot_cpu_idx))
         waker = -1;
     printf("  Waker CPU: %d (boot CPU %d)\n", waker, boot_cpu_idx);
+
+    if (waker < 0) {
+        /* Nothing can restart the gated core: sleeping now would just hit the watchdog */
+        printf("  No usable waker core, skipping Level 4 sleep\n");
+        if (cpu_features->cyc_ovrd)
+            msr(SYS_IMP_APL_CYC_OVRD, cyc_ovrd_saved);
+        msr(SYS_IMP_APL_ACC_OVRD, acc_ovrd_saved);
+        msr(CNTP_CTL_EL0, 0);
+        sysop("isb");
+        return 0;
+    }
 
     /* Safety net: reset the SoC if the wake or the resume never happens */
     wdt_arm(sleep_us / 1000 + S2R_WDT_MARGIN_MS);
@@ -602,10 +657,7 @@ static int test_level4_deep_sleep(u32 sleep_us)
         if (waker >= 0)
             s2r_crumb(10);
     }
-    if (S2R_L4_MODE != 2) {
-        /* PMGR stop request; needs wake_info: prepare it even without a waker */
-        if (waker < 0)
-            smp_wake_prepare(boot_cpu_idx);
+    if (waker >= 0) {
         smp_wake_stop_request();
         s2r_crumb(11);
     }
@@ -657,6 +709,160 @@ static int test_level4_deep_sleep(u32 sleep_us)
     s2r_check_secondary("level4 end");
 
     printf("  Level 4: PASS\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  E2: SMC power button / lid wake (AIC mailbox IRQ)                  */
+/* ------------------------------------------------------------------ */
+
+#ifndef S2R_E2
+#define S2R_E2 1
+#endif
+
+#ifndef S2R_E2_MASK
+#define S2R_E2_MASK 0x7 /* bit n: run mode n (0 = E2a, 1 = E2b, 2 = E2c) */
+#endif
+
+#define S2R_SMC_IRQ        403 /* t8103.dtsi smc_mbox: "recv-not-empty" */
+#define S2R_E2_TIMEOUT_MS  30000
+#define SMC_EV_BTN         0x7201
+#define SMC_EV_LID         0x7203
+
+static bool smc_notif_is_wake(u32 notif)
+{
+    u32 type = notif >> 16;
+    return type == SMC_EV_BTN || type == SMC_EV_LID;
+}
+
+static void s2r_print_smc_irqs(void)
+{
+    int node = adt_path_offset(adt, "/arm-io/smc");
+    u32 len;
+    const u32 *irqs = node >= 0 ? adt_getprop(adt, node, "interrupts", &len) : NULL;
+
+    if (!irqs)
+        return;
+    printf("  SMC: ADT interrupts:");
+    for (u32 i = 0; i < len / 4; i++)
+        printf(" %u", irqs[i]);
+    printf(" (using %d as mailbox recv-not-empty)\n", S2R_SMC_IRQ);
+}
+
+/*
+ * Sleep until the SMC reports a power button or lid event (or the watchdog fires).
+ * deep=false: plain WFI (E2a). deep=true: Level 3 overrides + reset-vector resume (E2b).
+ */
+static int test_smc_button_wake(int mode)
+{
+    bool deep = mode >= 1;
+    const char *name = mode == 2 ? "E2c" : deep ? "E2b" : "E2a";
+
+    printf("\n--- %s: SMC power button wake from %s ---\n", name,
+           mode == 2 ? "Level 4 DEEP_SLEEP (power-gated core, no waker core)"
+                     : deep ? "Level 3 deep WFI (reset-vector resume)" : "plain WFI");
+
+    u64 cyc_ovrd_saved = 0;
+    u64 acc_ovrd_saved = mrs(SYS_IMP_APL_ACC_OVRD);
+
+    smc_dev_t *smc = smc_init();
+    if (!smc) {
+        printf("  SMC init failed, skipping\n");
+        return 0;
+    }
+    s2r_print_smc_irqs();
+    if (smc_enable_notifications(smc))
+        printf("  SMC: enabling notifications (NTAP) failed\n");
+
+    u32 me = aic_whoami();
+    if (!aic_route_irq(S2R_SMC_IRQ, BIT(me))) {
+        printf("  AIC routing unsupported, skipping\n");
+        smc_shutdown(smc);
+        return 0;
+    }
+
+    /* The CPU timer must not be a wake source */
+    msr(CNTP_CTL_EL0, 0);
+    sysop("isb");
+
+    if (mode == 2 && cpu_features->sleep_mode != SLEEP_GLOBAL) {
+        printf("  E2c only implemented for SLEEP_GLOBAL, skipping\n");
+        smc_shutdown(smc);
+        return 0;
+    }
+
+    if (deep) {
+        if (mode == 2 && in_el2())
+            reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+        if (cpu_features->sleep_mode == SLEEP_GLOBAL) {
+            reg_mask(SYS_IMP_APL_ACC_OVRD, ACC_OVRD_DIS_L2_FLUSH_ACC_SLEEP_MASK,
+                     ACC_OVRD_PWR_DN_SRM(3) | ACC_OVRD_DIS_L2_FLUSH_ACC_SLEEP(2) |
+                         ACC_OVRD_TRAIN_DOWN_LINK(3) | ACC_OVRD_POWER_DOWN_CPM(3) |
+                         ACC_OVRD_DISABLE_PIO_ON_WFI_CPU |
+                         (mode == 2 ? ACC_OVRD_DEEP_SLEEP : 0));
+        }
+        if (cpu_features->cyc_ovrd) {
+            cyc_ovrd_saved = mrs(SYS_IMP_APL_CYC_OVRD);
+            reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK,
+                     CYC_OVRD_WFI_MODE(3) | CYC_OVRD_DISABLE_WFI_RET);
+        }
+    }
+
+    wdt_arm(S2R_E2_TIMEOUT_MS);
+    printf("  >>> Press the power button (or open the lid) within %d s, else the watchdog resets\n",
+           S2R_E2_TIMEOUT_MS / 1000);
+
+    u64 t0 = mrs(CNTPCT_EL0);
+    bool woken = false;
+    int sleeps = 0;
+
+    while (!woken) {
+        smc_poll(smc); /* empty the mailbox so the level IRQ is de-asserted */
+        aic_unmask_irq(S2R_SMC_IRQ);
+
+        s2r_sleep_type = mode == 2 ? 7 : deep ? 6 : 5;
+        sleeps++;
+        if (deep)
+            s2r_enter_deep((void *)0);
+        else
+            s2r_enter((void *)0);
+
+        aic_mask_irq(S2R_SMC_IRQ);
+        printf("  Back from WFI #%d, polling SMC mailbox\n", sleeps);
+        /* The notification can trail the syslog message by a while: keep polling */
+        int handled = 0;
+        u64 settle = timeout_calculate(200000);
+        while (!timeout_expired(settle))
+            handled += smc_poll(smc);
+        printf("  smc_poll handled %d message(s)\n", handled);
+
+        u32 n = smc_notification_count(smc);
+        u32 last = smc_last_notification(smc);
+        printf("  Woke up #%d: %u SMC notification(s), last 0x%08x\n", sleeps, n, last);
+        if (n && smc_notif_is_wake(last))
+            woken = true;
+    }
+
+    u64 t1 = mrs(CNTPCT_EL0);
+    wdt_stop();
+
+    if (deep) {
+        if (cpu_features->cyc_ovrd)
+            msr(SYS_IMP_APL_CYC_OVRD, cyc_ovrd_saved);
+        msr(SYS_IMP_APL_ACC_OVRD, acc_ovrd_saved);
+        sysop("isb");
+    }
+
+    printf("  Button/lid event 0x%08x after %lu ms\n", smc_last_notification(smc),
+           ((t1 - t0) * 1000) / mrs(CNTFRQ_EL0));
+
+    if (mode == 2) {
+        int restarted = smp_restart_unresponsive();
+        printf("  Restarted %d unresponsive secondary CPU(s)\n", restarted);
+    }
+
+    smc_shutdown(smc);
+    printf("  %s: PASS\n", name);
     return 0;
 }
 
@@ -726,6 +932,9 @@ int s2r_test(u32 sleep_us, int pmic)
         return -1;
     }
 
+    /* E1a: WD0 IRQ through the AIC wakes a plain WFI (sanity check for the deep-sleep E1) */
+    test_wd0_irq_sanity(2000000);
+
     /* Level 2: Deep WFI with state retention */
     ret = test_level2_deep_wfi_retention(sleep_us);
     if (ret < 0) {
@@ -750,6 +959,13 @@ int s2r_test(u32 sleep_us, int pmic)
         printf("\nABORT: DEEP_SLEEP test failed.\n");
         return -1;
     }
+
+#if S2R_E2
+    /* E2: interactive, needs a power button press (30 s watchdog) */
+    for (int m = 0; m < 3; m++)
+        if (S2R_E2_MASK & BIT(m))
+            test_smc_button_wake(m);
+#endif
 
     printf("\n========================================\n");
     printf("  All levels PASSED!\n");

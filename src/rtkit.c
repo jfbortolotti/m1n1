@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 
+/* S2R debug: print SMC firmware syslog on the UART */
+#define RTKIT_SYSLOG
+
 #include "../config.h"
 
 #include "rtkit.h"

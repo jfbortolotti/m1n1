@@ -201,6 +201,32 @@ void aic_set_sw(int irq, bool active)
                 MASK_BIT(irq));
 }
 
+bool aic_route_irq(int irq, u32 cpu_mask)
+{
+    if (!aic || aic->version != 1 || irq < 0 || (u32)irq >= aic->nr_irq)
+        return false;
+
+    write32(aic->base + aic->regs.tgt_cpu + 4 * irq, cpu_mask);
+    return true;
+}
+
+void aic_unmask_irq(int irq)
+{
+    if (aic && aic->version == 1)
+        write32(aic->base + aic->regs.mask_clr + MASK_REG(irq), MASK_BIT(irq));
+}
+
+void aic_mask_irq(int irq)
+{
+    if (aic && aic->version == 1)
+        write32(aic->base + aic->regs.mask_set + MASK_REG(irq), MASK_BIT(irq));
+}
+
+u32 aic_whoami(void)
+{
+    return aic ? read32(aic->base + AIC_WHOAMI) : 0;
+}
+
 void aic_write(u32 reg, u32 val)
 {
     write32(aic->base + reg, val);

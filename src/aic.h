@@ -42,4 +42,10 @@ void aic_set_sw(int irq, bool active);
 void aic_write(u32 reg, u32 val);
 uint32_t aic_ack(void);
 
+/* AIC1 only (T8103 etc.): send a hardware IRQ to the CPUs in cpu_mask, and (un)mask it. */
+bool aic_route_irq(int irq, u32 cpu_mask);
+void aic_unmask_irq(int irq);
+void aic_mask_irq(int irq);
+u32 aic_whoami(void);
+
 #endif
