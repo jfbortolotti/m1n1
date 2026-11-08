@@ -95,7 +95,14 @@ static void smc_send(smc_dev_t *smc, u64 message)
     rtkit_send(smc->rtkit, &msg);
 }
 
+static int smc_cmd_result(smc_dev_t *smc, u64 message, u64 *res);
+
 static int smc_cmd(smc_dev_t *smc, u64 message)
+{
+    return smc_cmd_result(smc, message, NULL);
+}
+
+static int smc_cmd_result(smc_dev_t *smc, u64 message, u64 *res)
 {
     u8 id = smc->msgid++ & 0xF;
     assert(!smc->outstanding[id]);
@@ -108,6 +115,8 @@ static int smc_cmd(smc_dev_t *smc, u64 message)
         smc_work(smc);
 
     u64 result = smc->ret[id];
+    if (res)
+        *res = result;
     u32 ret = FIELD_GET(SMC_RESULT_RESULT, result);
     if (ret) {
         printf("SMC: smc_cmd[0x%x] failed: %u\n", id, ret);
@@ -218,6 +227,27 @@ int smc_write_u32(smc_dev_t *smc, u32 key, u32 value)
     return smc_cmd(smc, msg);
 }
 
+/* Read a key: values of up to 4 bytes come back in the result message, longer ones in shmem */
+int smc_read(smc_dev_t *smc, u32 key, void *buf, u8 size)
+{
+    u64 msg = FIELD_PREP(SMC_MSG_TYPE, SMC_READ_KEY);
+    msg |= FIELD_PREP(SMC_WRITE_KEY_SIZE, size);
+    msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
+
+    u64 result = 0;
+    int ret = smc_cmd_result(smc, msg, &result);
+    if (ret)
+        return ret;
+
+    if (size <= 4) {
+        u32 v = FIELD_GET(SMC_RESULT_VALUE, result);
+        memcpy(buf, &v, size);
+    } else {
+        memcpy(buf, smc->shmem, size);
+    }
+    return 0;
+}
+
 int smc_write_flag(smc_dev_t *smc, u32 key, u8 value)
 {
     memcpy(smc->shmem, &value, sizeof(value));
@@ -232,4 +262,10 @@ int smc_write_flag(smc_dev_t *smc, u32 key, u8 value)
 int smc_enable_notifications(smc_dev_t *smc)
 {
     return smc_write_flag(smc, 0x4e544150 /* 'NTAP' */, 1);
+}
+
+/* Report the AP power state to the SMC (RTKit management endpoint), as macOS does on sleep */
+bool smc_set_ap_power(smc_dev_t *smc, u16 state)
+{
+    return rtkit_set_ap_power(smc->rtkit, state, 200000);
 }

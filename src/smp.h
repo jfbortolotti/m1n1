@@ -50,7 +50,9 @@ void smp_send_ipi(int cpu);
  * smp_wake_start:        PMGR start write for the prepared cpu. Safe to call from any core.
  */
 bool smp_wake_prepare(int cpu);
+void smp_fix_boot_rvbar(void);
 void smp_wake_stop_request(void);
+int smp_stop_request_all(void);
 void smp_wake_start(void);
 
 /*

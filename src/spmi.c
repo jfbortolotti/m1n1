@@ -135,8 +135,11 @@ static int raw_command(spmi_dev_t *dev, u8 addr, u8 opc, u16 extra, const u8 *da
             data_out[i++] = data >> (j++ * 8);
     }
 
-    if (FIELD_GET(SPMI_REPLY_FRAME_PARITY, reply) != MASK(len_out))
+    if (FIELD_GET(SPMI_REPLY_FRAME_PARITY, reply) != MASK(len_out)) {
+        printf("spmi: frame parity 0x%lx, expected 0x%lx (reply 0x%x)\n",
+               FIELD_GET(SPMI_REPLY_FRAME_PARITY, reply), MASK(len_out), reply);
         return -SPMI_ERR_BUS_IO;
+    }
     if (!len_in && !(reply & SPMI_REPLY_ACK))
         return -SPMI_ERR_BUS_IO;
     return 0;

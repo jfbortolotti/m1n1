@@ -308,6 +308,7 @@ int display_start_dcp(void)
         printf("display: failed to find display DVA\n");
         fb_dva = 0;
         dcp_shutdown(dcp, false);
+        dcp = NULL;
         return -1;
     }
 
@@ -315,6 +316,7 @@ int display_start_dcp(void)
     if (!iboot) {
         printf("display: failed to initialize DCP iBoot interface\n");
         dcp_shutdown(dcp, false);
+        dcp = NULL;
         return -1;
     }
 
@@ -665,6 +667,96 @@ int display_init(void)
     }
 }
 
+/*
+ * S2R: macOS powers the display down before system sleep. When the display was already
+ * initialized by iBoot, m1n1 never started its own DCP session: start one and put the DCP
+ * to sleep (dcp_shutdown(.., true) = RTKit sleep + PMGR reset of the DCP).
+ */
+int display_sleep_dcp(void)
+{
+    const display_config_t *disp_cfg = display_get_config(); /* also sets has_dcp */
+
+    if (!disp_cfg || !has_dcp) {
+        printf("display: no DCP config\n");
+        return -1;
+    }
+    if (iboot) {
+        dcp_ib_shutdown(iboot);
+        iboot = NULL;
+    }
+    if (!dcp)
+        dcp = dcp_init(disp_cfg);
+    if (!dcp) {
+        printf("display: failed to initialize DCP\n");
+        return -1;
+    }
+    /* Turn the panel (and its backlight) off through the DCP before sleeping it, as macOS does */
+    if (!display_is_external) {
+        dcp_iboot_if_t *ib = dcp_ib_init(dcp);
+        if (ib) {
+            int ret = dcp_ib_set_power(ib, false);
+            printf("display: panel power off: %d\n", ret);
+            for (int i = 0; i < 20; i++) {
+                dcp_work(dcp);
+                mdelay(10);
+            }
+            dcp_ib_shutdown(ib);
+        } else {
+            printf("display: no iBoot interface, panel left on\n");
+        }
+    }
+    printf("display: Sleeping DCP (S2R)\n");
+    dcp_shutdown(dcp, true);
+    dcp = NULL;
+    return 0;
+}
+
+/*
+ * S2R battery test: switch the internal panel (and its backlight) off or back on through the DCP
+ * iBoot interface, keeping the DCP session open so it can be switched on again.
+ */
+int display_panel_power(bool on)
+{
+    const display_config_t *disp_cfg = display_get_config();
+
+    if (!disp_cfg || !has_dcp || display_is_external)
+        return -1;
+
+    if (on) {
+        /*
+         * Power-on alone leaves the panel black (it needs a mode set and a swap): close our DCP
+         * session and run the full reconfiguration m1n1 uses at boot.
+         */
+        if (iboot) {
+            dcp_ib_shutdown(iboot);
+            iboot = NULL;
+        }
+        if (dcp) {
+            dcp_shutdown(dcp, false);
+            dcp = NULL;
+        }
+        int ret = display_configure(NULL);
+        fb_set_active(true); /* fb_reinit() leaves the text console inactive (logo only) */
+        return ret;
+    }
+
+    if (!dcp)
+        dcp = dcp_init(disp_cfg);
+    if (!dcp)
+        return -1;
+    if (!iboot)
+        iboot = dcp_ib_init(dcp);
+    if (!iboot)
+        return -1;
+
+    int ret = dcp_ib_set_power(iboot, false);
+    for (int i = 0; i < 20; i++) {
+        dcp_work(dcp);
+        mdelay(10);
+    }
+    return ret;
+}
+
 void display_shutdown(dcp_shutdown_mode mode)
 {
     /* We have no DCP, so just exit */
@@ -691,5 +783,6 @@ void display_shutdown(dcp_shutdown_mode mode)
                 break;
         }
         iboot = NULL;
+        dcp = NULL; /* freed by dcp_shutdown(); display_sleep_dcp() must not reuse it */
     }
 }

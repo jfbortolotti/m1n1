@@ -456,6 +456,46 @@ static bool get_cpu_pmgr_info(int cpu, struct cpu_pmgr_info *out)
     return true;
 }
 
+/*
+ * The boot CPU's RVBAR is locked by iBoot to the start of the image iBoot loaded. For an
+ * iBoot-loaded m1n1 that is _vectors_start; a chainloaded m1n1 is placed at the same address
+ * but starts with its Mach-O header, so _vectors_start is 0x4000 higher and a reset-vector wake
+ * would execute the header. Put "ldr x16, 8; br x16; .quad _vectors_start" there (the header is
+ * not used after loading), cleaned to PoC for the core coming up with caches off.
+ */
+void smp_fix_boot_rvbar(void)
+{
+    struct cpu_pmgr_info info;
+
+    if (!get_cpu_pmgr_info(boot_cpu_idx, &info))
+        return;
+    u64 rvbar = read64(info.impl);
+    u64 addr = rvbar & GENMASK(47, 12);
+    if (!(rvbar & 1) || addr == (u64)_vectors_start)
+        return;
+    if (addr < (u64)_base || addr + 16 > (u64)_vectors_start) {
+        printf("RVBAR: locked to 0x%lx, outside this image's header (%p..%p), not patched\n",
+               addr, _base, _vectors_start);
+        return;
+    }
+    /* the image (header included) is mapped RX: make the header page writable meanwhile */
+    u64 page = ALIGN_DOWN(addr, 0x4000);
+    mmu_add_mapping(page, page, 0x4000, MAIR_IDX_NORMAL, PERM_RWX);
+    volatile u32 *t = (volatile u32 *)addr;
+    t[0] = 0x58000050; /* ldr x16, #8 */
+    t[1] = 0xd61f0200; /* br x16 */
+    t[2] = (u32)(u64)_vectors_start;
+    t[3] = (u32)((u64)_vectors_start >> 32);
+    dc_civac_range((void *)addr, 16);
+    sysop("dsb sy");
+    mmu_add_mapping(page, page, 0x4000, MAIR_IDX_NORMAL, PERM_RX_EL0);
+    sysop("ic iallu");
+    sysop("dsb sy");
+    sysop("isb");
+    printf("RVBAR: locked to 0x%lx (chainloaded), trampoline to _vectors_start %p installed\n",
+           addr, _vectors_start);
+}
+
 bool smp_wake_prepare(int cpu)
 {
     struct cpu_pmgr_info info;
@@ -481,6 +521,8 @@ bool smp_wake_prepare(int cpu)
         write64(wake_info.impl, (u64)_vectors_start);
         sysop("dmb sy");
     }
+    else if (cpu == boot_cpu_idx)
+        smp_fix_boot_rvbar();
 
     wake_info.valid = true;
     return true;
@@ -666,4 +708,20 @@ u64 smp_get_release_addr(int cpu)
     target->args[2] = 0;
     target->args[3] = 0;
     return (u64)&target->target;
+}
+
+/* PMGR stop request for every known CPU, as each core does on macOS before system sleep */
+int smp_stop_request_all(void)
+{
+    int n = 0;
+
+    for (int i = 0; i < MAX_CPUS; i++) {
+        struct cpu_pmgr_info info;
+
+        if (!get_cpu_pmgr_info(i, &info))
+            continue;
+        write32(info.base + 0x0, 1 << (4 * info.cluster + info.core));
+        n++;
+    }
+    return n;
 }

@@ -466,3 +466,19 @@ u32 pmgr_get_feature(const char *name)
 
     return val;
 }
+
+/* S2R: print every die 0 power-state register as "SNAP PS <name> <addr> <value>" */
+void pmgr_snapshot_ps(void)
+{
+    if (!pmgr_initialized)
+        return;
+    for (size_t i = 0; i < pmgr_devices_len; ++i) {
+        const struct pmgr_device *device = &pmgr_devices[i];
+        if (device->flags & PMGR_FLAG_VIRTUAL)
+            continue;
+        uintptr_t addr = pmgr_device_get_addr(0, device);
+        if (!addr)
+            continue;
+        printf("SNAP PS %.16s %lx %08x\n", device->name, addr, read32(addr));
+    }
+}

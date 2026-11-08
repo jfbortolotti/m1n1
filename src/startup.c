@@ -240,6 +240,23 @@ void _cpu_reset_c(void *stack)
     /* Keep it in a register: stores are only safe once the MMU is back on */
     u64 s2r_entry_ts = mrs(CNTPCT_EL0);
 
+#ifdef S2R_WAKE_BEACON
+    /*
+     * S2R wake beacon: after a real SoC sleep USB and the display are down, so nothing we
+     * print can be seen. If the boot CPU comes back from the E2 sleep (s2r_sleep_type is
+     * 5 + mode), reset the SoC right away through the watchdog (T8103 address): a chime
+     * after the power button press proves that the wake happened.
+     */
+    if (is_boot_cpu() && s2r_ctx.magic == S2R_CTX_MAGIC && s2r_sleep_type >= 5 + 13 &&
+        s2r_sleep_type < 5 + 32) {
+        write32(0x23d2b0000 + 0x10, 0);
+        write32(0x23d2b0000 + 0x14, 24000); /* 1 ms */
+        write32(0x23d2b0000 + 0x1c, 4);
+        while (1)
+            sysop("wfe");
+    }
+#endif
+
     s2r_crumb(1);
 
     if (!is_boot_cpu())

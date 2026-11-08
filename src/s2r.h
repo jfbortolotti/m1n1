@@ -31,6 +31,21 @@
  *   5    = E2a (SMC button wake, plain WFI)
  *   6    = E2b (SMC button wake, Level 3 deep WFI)
  *   7    = E2c (SMC button wake, Level 4 DEEP_SLEEP, no waker core)
+ *   8    = E2d (E2c after the macOS SMC sleep handshake)
+ *   9    = E2e (E2d + GPIO wake group clear + per-core PMGR stop requests)
+ *   10   = E2f (E2e + PMU boot_stage, sleep timestamp and sleep flag)
+ *   11   = E2g (E2f with every secondary in deep sleep too)
+ *   12   = E2h (E2g + macOS auto power states on memory/fabric/NUB domains)
+ *   13   = E2i (E2h + PMP coprocessor idle and CPU stopped)
+ *   14   = E2j (E2i with the PMP booted first, as under macOS)
+ *   15   = E2k (E2j with all watchdogs off as macOS does, no safety watchdog)
+ *   16   = E2l (E2k + display off + PMGR quiesce replay + SPMI +0x38)
+ *   17   = E2m (E2l + SEP sleep message, NVMe shutdown, PMP ep 0x20 replay)
+ *   18   = E2n (E2m + PMP ep 0x20 init as at macOS boot + AIC IPI quiesce)
+ *   19   = E2o (E2n + power domains off as macOS leaves them before sleep)
+ *   20   = E2p (E2o + every power state as in the macOS snapshot of hypervisor trace 8)
+ *   21   = E2q (E2p + SEP/APCIE_GP/DEBUG_USB/DEBUG_AUTH forced off, ATC1 USB off last)
+ *   22   = E2r (E2q + AOP booted, then SetAPPower 0x201 before sleep as macOS)
  *   0xAA = test complete
  */
 extern volatile u32 s2r_sleep_type;
@@ -46,6 +61,9 @@ extern volatile u32 s2r_sleep_type;
 int s2r_test(u32 sleep_us, int pmic);
 
 #define S2R_CTX_MAGIC 0x53325243545831ULL /* "S2RCTX1" */
+
+/* E2n/E2o: reset through the watchdog as soon as the boot CPU wakes (see _cpu_reset_c) */
+#define S2R_WAKE_BEACON
 
 /* Saved CPU context for resume after a reset-vector wake (offsets in s2r_asm.S) */
 struct s2r_ctx {

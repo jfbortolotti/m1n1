@@ -18,6 +18,8 @@ int display_init(void);
 int display_start_dcp(void);
 int display_configure(const char *config);
 void display_shutdown(dcp_shutdown_mode mode);
+int display_sleep_dcp(void);
+int display_panel_power(bool on);
 const display_config_t *display_get_config(void);
 
 #endif

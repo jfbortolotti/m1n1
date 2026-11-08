@@ -100,6 +100,7 @@ struct rtkit_dev {
     struct rtkit_buffer syslog_bfr;
     struct rtkit_buffer crashlog_bfr;
     struct rtkit_buffer ioreport_bfr;
+    struct rtkit_buffer oslog_bfr;
 
     u32 syslog_cnt, syslog_size;
 
@@ -181,6 +182,7 @@ void rtkit_free(rtkit_dev_t *rtk)
     rtkit_free_buffer(rtk, &rtk->syslog_bfr);
     rtkit_free_buffer(rtk, &rtk->crashlog_bfr);
     rtkit_free_buffer(rtk, &rtk->ioreport_bfr);
+    rtkit_free_buffer(rtk, &rtk->oslog_bfr);
     free(rtk->name);
     free(rtk);
 }
@@ -355,10 +357,29 @@ static void rtkit_crashed(rtkit_dev_t *rtk)
             case 'Cstr':
                 rtkit_printf("  Message %d: %s\n", p->payload[0], &p->payload[4]);
                 break;
+            case 'Crg8': {
+                /* proxyclient m1n1/fw/asc/crash.py CrashCrg8 layout */
+                u64 *r = (u64 *)&p->payload[8];
+                u64 *x = (u64 *)p->payload;
+                rtkit_printf("  Crg8: PC 0x%lx SP 0x%lx PSR 0x%lx FAR 0x%lx ESR 0x%lx\n",
+                             x[0x108 / 8], x[0x100 / 8], x[0x110 / 8], x[0x330 / 8],
+                             x[0x340 / 8]);
+                for (int i = 0; i < 31; i += 4)
+                    rtkit_printf("    x%d: %016lx %016lx %016lx %016lx\n", i, r[i],
+                                 i + 1 < 31 ? r[i + 1] : 0, i + 2 < 31 ? r[i + 2] : 0,
+                                 i + 3 < 31 ? r[i + 3] : 0);
+                break;
+            }
             default:
-                rtkit_printf("  0x%x\n", p->type);
+                rtkit_printf("  0x%x (%c%c%c%c) flags 0x%x len 0x%x\n", p->type,
+                             (p->type >> 24) & 0xff, (p->type >> 16) & 0xff,
+                             (p->type >> 8) & 0xff, p->type & 0xff, p->flags, p->len);
+                if (p->len > 16)
+                    hexdump(p->payload, min(p->len - 16, 0x180U));
                 break;
         }
+        if (!p->len)
+            break;
         p = ((void *)p) + p->len;
     }
 }
@@ -464,7 +485,26 @@ int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
                 }
                 break;
             case RTKIT_EP_OSLOG:
-                rtkit_printf("unknown oslog message %lx\n", msg->msg);
+                /*
+                 * Buffer request without an IOVA (AOP: 0x0110000000000000 = type 1, 0x10000
+                 * bytes). macOS answers type 1 with the buffer IOVA >> 12 (0x010000000000004c);
+                 * until then the AOP does not handle management messages (SetAPPower).
+                 */
+                if ((msg->msg >> 56) == 1 && !(msg->msg & GENMASK(47, 0)) && !rtk->oslog_bfr.bfr) {
+                    /* SIZE: bits 55:48 in 4K pages, DVA: bits 47:0 >> 12 */
+                    size_t sz = ALIGN_UP(FIELD_GET(GENMASK(55, 48), msg->msg) << 12, SZ_16K);
+                    struct asc_message reply = {.msg1 = msg->ep};
+                    if (!sz || !rtkit_alloc_buffer(rtk, &rtk->oslog_bfr, sz)) {
+                        rtkit_printf("unable to allocate oslog buffer (0x%lx)\n", sz);
+                        break;
+                    }
+                    reply.msg0 = (1UL << 56) | ((rtk->oslog_bfr.dva | rtk->dva_base) >> 12);
+                    rtkit_printf("oslog buffer 0x%lx bytes at dva 0x%lx\n", sz, rtk->oslog_bfr.dva);
+                    if (!asc_send(rtk->asc, &reply))
+                        rtkit_printf("unable to send oslog buffer reply\n");
+                } else {
+                    rtkit_printf("unknown oslog message %lx\n", msg->msg);
+                }
                 break;
             default:
                 rtkit_printf("message to unknown system endpoint 0x%02x: %lx\n", msg->ep, msg->msg);
@@ -705,6 +745,45 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ta
             continue;
         } else if (ret < 0) {
             rtkit_printf("IOP died during shutdown\n");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/*
+ * Tell the IOP which power state the AP is in, without touching the IOP power state.
+ * macOS sends 0x201 (IDLE: "sleeping, retain state") to the SMC right before system sleep.
+ */
+bool rtkit_set_ap_power(rtkit_dev_t *rtk, u16 state, u32 timeout_us)
+{
+    struct asc_message msg;
+
+    if (rtk->crashed)
+        return false;
+
+    msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_AP_PWR_STATE) | FIELD_PREP(MGMT_PWR_STATE, state);
+    msg.msg1 = RTKIT_EP_MGMT;
+    if (!asc_send(rtk->asc, &msg)) {
+        rtkit_printf("unable to send AP power state 0x%x\n", state);
+        return false;
+    }
+
+    u64 timeout = timeout_calculate(timeout_us);
+    while (rtk->ap_power != state) {
+        struct rtkit_message rtk_msg;
+        int ret = rtkit_recv(rtk, &rtk_msg);
+
+        if (ret < 0) {
+            rtkit_printf("IOP died while setting AP power state\n");
+            return false;
+        } else if (ret > 0) {
+            printf("rtkit(%s): dropped message to endpoint 0x%02x while setting AP power: %lx\n",
+                   rtk->name, rtk_msg.ep, rtk_msg.msg);
+        }
+        if (timeout_expired(timeout)) {
+            rtkit_printf("AP power state 0x%x not acked (now 0x%x)\n", state, rtk->ap_power);
             return false;
         }
     }

@@ -31,5 +31,6 @@ int pmgr_power_on(int die, const char *name);
 int pmgr_set_mode(uintptr_t addr, u8 target_mode);
 
 u32 pmgr_get_feature(const char *name);
+void pmgr_snapshot_ps(void);
 
 #endif
