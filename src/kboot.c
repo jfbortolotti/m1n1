@@ -21,6 +21,7 @@
 #include "pmgr.h"
 #include "sep.h"
 #include "sio.h"
+#include "s2r.h"
 #include "smp.h"
 #include "tunables.h"
 #include "types.h"
@@ -2479,6 +2480,39 @@ __attribute__((unused)) static int dt_transfer_virtios(void)
  * memory channels depends on the storage configuration of the host Mac
  * and can only be determined at runtime.
  */
+/*
+ * EXPERIMENTAL Linux s2idle core power-gating (s2r.h): the boot CPU's RVBAR is locked to this
+ * image, so keep it out of Linux's memory (no-map) and publish the resume handoff. The reset
+ * vector runs on dummy_stack (inside the image) with the MMU off.
+ */
+extern u8 dummy_stack[];
+extern void *_reset_stack;
+static int dt_set_s2r_linux_resume(void)
+{
+    u64 start = ALIGN_DOWN((u64)_base, SZ_16K);
+    u64 end = ALIGN_UP((u64)_end, SZ_16K);
+
+    if (dt_get_or_add_reserved_mem("m1n1-resume", "asahi,m1n1-resume", true, start, end - start) <
+        0)
+        return -1;
+
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0)
+        bail("FDT: /chosen not found\n");
+    if (fdt_setprop_u64(dt, chosen, "asahi,m1n1-resume", (u64)&s2r_linux_resume))
+        bail("FDT: couldn't set chosen.asahi,m1n1-resume\n");
+
+    memset(&s2r_linux_resume, 0, sizeof(s2r_linux_resume));
+    _reset_stack = dummy_stack + 0x1000;
+    dc_civac_range(&s2r_linux_resume, sizeof(s2r_linux_resume));
+    dc_civac_range(&_reset_stack, sizeof(_reset_stack));
+    smp_fix_boot_rvbar();
+
+    printf("FDT: m1n1 image 0x%lx..0x%lx reserved, Linux resume handoff at %p\n", start, end,
+           &s2r_linux_resume);
+    return 0;
+}
+
 static int dt_set_pmgr(void)
 {
     if (chip_id != T8012)
@@ -2715,6 +2749,9 @@ int kboot_prepare_dt(void *fdt)
         fdt_node_check_compatible(dt, 0, "apple,t6021") == 0 ||
         fdt_node_check_compatible(dt, 0, "apple,t6022") == 0)
         dt_fixup_t6020_compat(dt);
+
+    if (dt_set_s2r_linux_resume())
+        return -1;
 
     /*
      * Set the /memory node late since we might be allocating from the top of memory

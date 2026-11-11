@@ -62,6 +62,23 @@ int s2r_test(u32 sleep_us, int pmic);
 
 #define S2R_CTX_MAGIC 0x53325243545831ULL /* "S2RCTX1" */
 
+/*
+ * Linux s2idle core power-gating resume handoff (EXPERIMENTAL). kboot reserves the m1n1 image
+ * in the Linux DT and publishes the physical address of this struct in
+ * /chosen "asahi,m1n1-resume". Before a WFI with CYC_OVRD.DISABLE_WFI_RET, Linux writes ->entry
+ * (physical address of cpu_resume) and ->magic, cleaned to PoC. When the boot CPU then comes
+ * back through RVBAR, _cpu_reset_c() sees the magic before printing anything, clears it, runs
+ * the CPU init quietly and jumps to ->entry at EL2 with the MMU and caches off.
+ */
+#define S2R_LINUX_RESUME_MAGIC 0x4c4e58524553554dULL /* "LNXRESUM" */
+struct s2r_linux_resume {
+    u64 magic;
+    u64 entry;
+    u64 count; /* resumes done, for Linux's statistics */
+    u64 pad[5];
+} __attribute__((aligned(64)));
+extern struct s2r_linux_resume s2r_linux_resume;
+
 /* E2n/E2o: reset through the watchdog as soon as the boot CPU wakes (see _cpu_reset_c) */
 #define S2R_WAKE_BEACON
 

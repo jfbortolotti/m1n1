@@ -235,8 +235,32 @@ static inline void write_sctlr(u64 val)
 /* Secondary SMP core boot */
 extern void mmu_secondary_setup(void);
 
+/* Linux s2idle core power-gating handoff, see s2r.h (published by kboot) */
+struct s2r_linux_resume s2r_linux_resume;
+
+/*
+ * MMU and caches off, Linux owns every device: no printf, no MMU setup. Only the CPU init
+ * (chicken bits, CYC_OVRD, counter redirect...) that Linux expects from m1n1, then cpu_resume.
+ */
+static void __attribute__((noreturn)) s2r_linux_resume_entry(void)
+{
+    u64 entry = s2r_linux_resume.entry;
+
+    s2r_linux_resume.magic = 0;
+    s2r_linux_resume.count++;
+    sysop("dsb sy");
+    init_cpu_quiet();
+    sysop("isb");
+    ((void (*)(void))entry)();
+    while (1)
+        sysop("wfi");
+}
+
 void _cpu_reset_c(void *stack)
 {
+    if (is_boot_cpu() && s2r_linux_resume.magic == S2R_LINUX_RESUME_MAGIC)
+        s2r_linux_resume_entry();
+
     /* Keep it in a register: stores are only safe once the MMU is back on */
     u64 s2r_entry_ts = mrs(CNTPCT_EL0);
 
