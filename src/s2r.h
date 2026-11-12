@@ -71,13 +71,37 @@ int s2r_test(u32 sleep_us, int pmic);
  * the CPU init quietly and jumps to ->entry at EL2 with the MMU and caches off.
  */
 #define S2R_LINUX_RESUME_MAGIC 0x4c4e58524553554dULL /* "LNXRESUM" */
+/*
+ * Secondary CPUs (Linux CPU hotplug, mem_sleep): one slot per Linux logical CPU, keyed by MPIDR.
+ * Before a power-gated WFI, Linux writes ->mpidr, ->entry and ->magic, cleaned to PoC. A
+ * secondary that comes back through RVBAR with a matching slot jumps to ->entry like the boot
+ * CPU above. One-shot: m1n1 clears ->magic. CYC_OVRD and ACC_OVRD survive the power-gate:
+ * m1n1 clears CYC_OVRD.DISABLE_WFI_RET (else the core's first idle WFI power-gates it again)
+ * and writes ->acc_ovrd back to ACC_OVRD if it is not 0.
+ */
+#define S2R_LINUX_MAX_CPUS 16
+struct s2r_linux_cpu {
+    u64 mpidr;
+    u64 magic;
+    u64 entry;
+    u64 count;
+    u64 acc_ovrd;
+    u64 pad[3];
+};
+
 struct s2r_linux_resume {
     u64 magic;
     u64 entry;
     u64 count; /* resumes done, for Linux's statistics */
     u64 pad[5];
+    struct s2r_linux_cpu cpu[S2R_LINUX_MAX_CPUS];
 } __attribute__((aligned(64)));
 extern struct s2r_linux_resume s2r_linux_resume;
+
+/* Per-core reset stacks for the handoff (two cores may come back through RVBAR together) */
+#define S2R_LINUX_STACK_SIZE 0x800
+extern u8 s2r_linux_stacks[S2R_LINUX_MAX_CPUS * S2R_LINUX_STACK_SIZE];
+extern u64 s2r_reset_stack_stride; /* used by cpu_reset (start.S): 0 = one shared stack */
 
 /* E2n/E2o: reset through the watchdog as soon as the boot CPU wakes (see _cpu_reset_c) */
 #define S2R_WAKE_BEACON

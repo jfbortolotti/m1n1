@@ -153,6 +153,15 @@ cpu_reset:
     adrp x1, _reset_stack
     add x1, x1, :lo12:_reset_stack
     ldr x1, [x1]
+    /* Linux handoff: per-core stacks, sp -= (4 * MPIDR.Aff1 + Aff0) * s2r_reset_stack_stride */
+    adrp x3, s2r_reset_stack_stride
+    ldr x3, [x3, :lo12:s2r_reset_stack_stride]
+    mrs x4, mpidr_el1
+    ubfx x5, x4, #8, #8
+    and x4, x4, #0xff
+    add x4, x4, x5, lsl #2
+    and x4, x4, #0xf
+    msub x1, x4, x3, x1
     mov sp, x1
 
     ldr x2, [sp, #-8]

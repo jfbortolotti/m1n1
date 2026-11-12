@@ -237,6 +237,8 @@ extern void mmu_secondary_setup(void);
 
 /* Linux s2idle core power-gating handoff, see s2r.h (published by kboot) */
 struct s2r_linux_resume s2r_linux_resume;
+u8 s2r_linux_stacks[S2R_LINUX_MAX_CPUS * S2R_LINUX_STACK_SIZE] __attribute__((aligned(16)));
+u64 s2r_reset_stack_stride;
 
 /*
  * MMU and caches off, Linux owns every device: no printf, no MMU setup. Only the CPU init
@@ -256,10 +258,48 @@ static void __attribute__((noreturn)) s2r_linux_resume_entry(void)
         sysop("wfi");
 }
 
+/* Same for a secondary CPU: its slot stays armed (see s2r.h) */
+static void __attribute__((noreturn)) s2r_linux_cpu_entry(struct s2r_linux_cpu *slot)
+{
+    u64 entry = slot->entry;
+    u64 acc = slot->acc_ovrd;
+
+    slot->magic = 0;
+    slot->count++;
+    sysop("dsb sy");
+    init_cpu_quiet();
+    reg_clr(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_DISABLE_WFI_RET);
+    if (acc)
+        msr(SYS_IMP_APL_ACC_OVRD, acc);
+    sysop("isb");
+    ((void (*)(void))entry)();
+    while (1)
+        sysop("wfi");
+}
+
+static struct s2r_linux_cpu *s2r_linux_cpu_slot(void)
+{
+    u64 mpidr = mrs(MPIDR_EL1) & 0xffffff;
+
+    for (int i = 0; i < S2R_LINUX_MAX_CPUS; i++) {
+        struct s2r_linux_cpu *slot = &s2r_linux_resume.cpu[i];
+
+        if (slot->magic == S2R_LINUX_RESUME_MAGIC && slot->mpidr == mpidr)
+            return slot;
+    }
+    return NULL;
+}
+
 void _cpu_reset_c(void *stack)
 {
     if (is_boot_cpu() && s2r_linux_resume.magic == S2R_LINUX_RESUME_MAGIC)
         s2r_linux_resume_entry();
+    if (!is_boot_cpu()) {
+        struct s2r_linux_cpu *slot = s2r_linux_cpu_slot();
+
+        if (slot)
+            s2r_linux_cpu_entry(slot);
+    }
 
     /* Keep it in a register: stores are only safe once the MMU is back on */
     u64 s2r_entry_ts = mrs(CNTPCT_EL0);

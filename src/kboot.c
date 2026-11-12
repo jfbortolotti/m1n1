@@ -2483,9 +2483,9 @@ __attribute__((unused)) static int dt_transfer_virtios(void)
 /*
  * EXPERIMENTAL Linux s2idle core power-gating (s2r.h): the boot CPU's RVBAR is locked to this
  * image, so keep it out of Linux's memory (no-map) and publish the resume handoff. The reset
- * vector runs on dummy_stack (inside the image) with the MMU off.
+ * vector runs on s2r_linux_stacks (inside the image, one per core) with the MMU off. The
+ * secondaries' RVBARs point to this image too (smp_start_cpu), for Linux CPU hotplug.
  */
-extern u8 dummy_stack[];
 extern void *_reset_stack;
 static int dt_set_s2r_linux_resume(void)
 {
@@ -2501,15 +2501,20 @@ static int dt_set_s2r_linux_resume(void)
         bail("FDT: /chosen not found\n");
     if (fdt_setprop_u64(dt, chosen, "asahi,m1n1-resume", (u64)&s2r_linux_resume))
         bail("FDT: couldn't set chosen.asahi,m1n1-resume\n");
+    if (fdt_setprop_u32(dt, chosen, "asahi,m1n1-resume-cpus", S2R_LINUX_MAX_CPUS))
+        bail("FDT: couldn't set chosen.asahi,m1n1-resume-cpus\n");
 
     memset(&s2r_linux_resume, 0, sizeof(s2r_linux_resume));
-    _reset_stack = dummy_stack + 0x1000;
+    /* the boot CPU (Aff 0.0) gets the top stack, as dummy_stack before */
+    _reset_stack = s2r_linux_stacks + sizeof(s2r_linux_stacks);
+    s2r_reset_stack_stride = S2R_LINUX_STACK_SIZE;
     dc_civac_range(&s2r_linux_resume, sizeof(s2r_linux_resume));
     dc_civac_range(&_reset_stack, sizeof(_reset_stack));
+    dc_civac_range(&s2r_reset_stack_stride, sizeof(s2r_reset_stack_stride));
     smp_fix_boot_rvbar();
 
-    printf("FDT: m1n1 image 0x%lx..0x%lx reserved, Linux resume handoff at %p\n", start, end,
-           &s2r_linux_resume);
+    printf("FDT: m1n1 image 0x%lx..0x%lx reserved, Linux resume handoff at %p (%d CPU slots)\n",
+           start, end, &s2r_linux_resume, S2R_LINUX_MAX_CPUS);
     return 0;
 }
 
