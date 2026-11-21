@@ -1310,6 +1310,172 @@ static int dt_set_pcie_tunables(void)
     return 0;
 }
 
+/*
+ * t8103 apcie tunables for the Linux pcie-apple cold re-init after APCIE_GP was powered off
+ * in suspend (pcie_apple.power_off_gp, 2026-11-15). Offsets are made relative to the Linux
+ * "rc" reg (common, PHY, PHY IP, fuses) and "axi" reg (axi2af) of the pcie node, and to the
+ * port config reg / root port config space (ECAM + port << 15) on the port nodes. Optional:
+ * on any error all the properties are removed and Linux refuses power_off_gp.
+ */
+static const char *const apcie_fdt_props[] = {
+    "apple,tunable-axi2af",   "apple,tunable-common",        "apple,tunable-phy",
+    "apple,tunable-phy-fuses", "apple,tunable-phy-ip-pll",   "apple,tunable-phy-ip-auspma",
+};
+static const char *const apcie_fdt_port_props[] = {
+    "apple,tunable-port-config", "apple,tunable-rc", "apple,tunable-rc-gen3-shadow",
+    "apple,tunable-rc-gen4-shadow", "apple,max-link-speed",
+};
+
+static int dt_fdt_reg(int node, int idx, u64 *addr, u64 *size)
+{
+    int len;
+    const fdt32_t *reg = fdt_getprop(dt, node, "reg", &len);
+    int parent = fdt_parent_offset(dt, node);
+
+    if (!reg || parent < 0 || fdt_address_cells(dt, parent) != 2 ||
+        fdt_size_cells(dt, parent) != 2 || len < 16 * (idx + 1))
+        return -1;
+    reg += 4 * idx;
+    *addr = ((u64)fdt32_ld(&reg[0]) << 32) | fdt32_ld(&reg[1]);
+    *size = ((u64)fdt32_ld(&reg[2]) << 32) | fdt32_ld(&reg[3]);
+    return 0;
+}
+
+static int dt_apcie_port_node(int fdt_node, u32 port)
+{
+    int child;
+
+    fdt_for_each_subnode(child, dt, fdt_node)
+    {
+        int len;
+        const fdt32_t *reg = fdt_getprop(dt, child, "reg", &len);
+        if (reg && len >= 4 && (fdt32_ld(reg) >> 11) == port)
+            return child;
+    }
+    return -1;
+}
+
+static int dt_set_apcie_tunables_node(const char *path, int fdt_node)
+{
+    int adt_path[8];
+    int adt_node = adt_path_offset_trace(adt, path, adt_path);
+    u64 rc, rc_size, axi, axi_size, a;
+    u32 ports, fuses[3 * 16];
+    int axi_idx, n;
+
+    if (adt_node < 0 || !adt_is_compatible(adt, adt_node, "apcie,t8103"))
+        bail("APCIE: %s not a t8103 apcie\n", path);
+    axi_idx = fdt_stringlist_search(dt, fdt_node, "reg-names", "axi");
+    if (axi_idx < 0)
+        bail("APCIE: no \"axi\" reg in the FDT pcie node (old DT?)\n");
+    if (dt_fdt_reg(fdt_node, 1, &rc, &rc_size) || dt_fdt_reg(fdt_node, axi_idx, &axi, &axi_size))
+        bail("APCIE: cannot read the FDT pcie regs\n");
+
+    /* global tunables: ADT reg index, FDT base, FDT window */
+    const struct {
+        const char *adt_name;
+        const char *fdt_name;
+        int reg_idx;
+        u64 base, size;
+    } glob[] = {
+        {"apcie-axi2af-tunables", apcie_fdt_props[0], 4, axi, axi_size},
+        {"apcie-common-tunables", apcie_fdt_props[1], 1, rc, rc_size},
+        {"apcie-phy-tunables", apcie_fdt_props[2], 2, rc, rc_size},
+        {"apcie-phy-ip-pll-tunables", apcie_fdt_props[4], 3, rc, rc_size},
+        {"apcie-phy-ip-auspma-tunables", apcie_fdt_props[5], 3, rc, rc_size},
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(glob); i++) {
+        if (adt_get_reg(adt, adt_path, "reg", glob[i].reg_idx, &a, NULL) || a < glob[i].base ||
+            a >= glob[i].base + glob[i].size)
+            bail("APCIE: ADT reg[%d] outside the FDT window for %s\n", glob[i].reg_idx,
+                 glob[i].adt_name);
+        struct adt_tunable_info info = {glob[i].adt_name, glob[i].fdt_name, a - glob[i].base,
+                                        glob[i].base + glob[i].size - a, true};
+        if (dt_append_acio_tunable(adt_node, fdt_node, &info))
+            bail("APCIE: unable to convert %s\n", glob[i].adt_name);
+    }
+
+    /* PHY fuses, relative to the PHY IP (reg[3]) */
+    if (adt_get_reg(adt, adt_path, "reg", 3, &a, NULL))
+        bail("APCIE: no PHY IP reg\n");
+    n = pcie_t8103_fuse_tunables(path, fuses, 16);
+    if (n < 0)
+        bail("APCIE: PHY fuses not read\n");
+    for (int i = 0; i < n; i++) {
+        if (fdt_appendprop_u32(dt, fdt_node, apcie_fdt_props[3], a - rc + fuses[3 * i]) ||
+            fdt_appendprop_u32(dt, fdt_node, apcie_fdt_props[3], fuses[3 * i + 1]) ||
+            fdt_appendprop_u32(dt, fdt_node, apcie_fdt_props[3], fuses[3 * i + 2]))
+            bail("APCIE: unable to add the PHY fuses\n");
+    }
+
+    /* ports */
+    if (ADT_GETPROP(adt, adt_node, "#ports", &ports) < 0)
+        bail("APCIE: no #ports\n");
+    for (u32 port = 0; port < ports; port++) {
+        char bridge[64];
+        int bnode, pnode;
+        u32 speed;
+
+        snprintf(bridge, sizeof(bridge), "%s/pci-bridge%d", path, port);
+        bnode = adt_path_offset(adt, bridge);
+        pnode = dt_apcie_port_node(fdt_node, port);
+        if (bnode < 0 || pnode < 0)
+            continue;
+
+        const struct adt_tunable_info pt[] = {
+            {"apcie-config-tunables", apcie_fdt_port_props[0], 0, 0x4000, true},
+            {"pcie-rc-tunables", apcie_fdt_port_props[1], 0, 0x8000, true},
+            {"pcie-rc-gen3-shadow-tunables", apcie_fdt_port_props[2], 0, 0x8000, true},
+            {"pcie-rc-gen4-shadow-tunables", apcie_fdt_port_props[3], 0, 0x8000, true},
+        };
+        for (size_t i = 0; i < ARRAY_SIZE(pt); i++) {
+            if (dt_append_acio_tunable(bnode, pnode, &pt[i]))
+                bail("APCIE: unable to convert %s for port %d\n", pt[i].adt_name, port);
+            pnode = dt_apcie_port_node(fdt_node, port); /* offsets move when the FDT grows */
+            fdt_node = fdt_node_offset_by_compatible(dt, -1, "apple,t8103-pcie");
+        }
+
+        /* same rule as pcie_init_controller() */
+        if (ADT_GETPROP(adt, bnode, "maximum-link-speed", &speed) >= 0) {
+            if (speed == 1) {
+                int child = adt_first_child_offset(adt, bnode);
+                int target;
+                if (child >= 0 &&
+                    ((ADT_GETPROP(adt, child, "target-link-speed", &target) >= 0 && target > 0) ||
+                     (ADT_GETPROP(adt, child, "expected-link-speed", &target) >= 0 &&
+                      target > 0)))
+                    speed = target;
+            }
+            if (fdt_setprop_u32(dt, pnode, apcie_fdt_port_props[4], speed))
+                bail("APCIE: unable to set the max link speed for port %d\n", port);
+        }
+        printf("APCIE: port %d cold init tunables added\n", port);
+    }
+    return 0;
+}
+
+static int dt_set_apcie_tunables(void)
+{
+    int fdt_node = fdt_node_offset_by_compatible(dt, -1, "apple,t8103-pcie");
+
+    if (fdt_node < 0)
+        return 0;
+    if (!dt_set_apcie_tunables_node("/arm-io/apcie", fdt_node))
+        return 0;
+
+    /* partial data would let Linux try a broken cold init: remove everything */
+    fdt_node = fdt_node_offset_by_compatible(dt, -1, "apple,t8103-pcie");
+    for (size_t i = 0; fdt_node >= 0 && i < ARRAY_SIZE(apcie_fdt_props); i++)
+        fdt_delprop(dt, fdt_node, apcie_fdt_props[i]);
+    for (u32 port = 0; fdt_node >= 0 && port < 8; port++) {
+        int pnode = dt_apcie_port_node(fdt_node, port);
+        for (size_t i = 0; pnode >= 0 && i < ARRAY_SIZE(apcie_fdt_port_props); i++)
+            fdt_delprop(dt, pnode, apcie_fdt_port_props[i]);
+    }
+    printf("APCIE: cold init tunables not exported (pcie_apple.power_off_gp unavailable)\n");
+    return 0;
+}
+
 static int dt_get_iommu_node(int node, u32 num)
 {
     int len;
@@ -2505,6 +2671,14 @@ static int dt_set_s2r_linux_resume(void)
         bail("FDT: couldn't set chosen.asahi,m1n1-resume-cpus\n");
 
     memset(&s2r_linux_resume, 0, sizeof(s2r_linux_resume));
+    if (chip_id == T8103) {
+        s2r_linux_resume.ecl_pstate = read64(S2R_T8103_ECL_BASE + S2R_ECL_PSTATE);
+        s2r_linux_resume.ecl_apsc[0] = read64(S2R_T8103_ECL_BASE + S2R_ECL_APSC);
+        s2r_linux_resume.ecl_apsc[1] = read64(S2R_T8103_ECL_BASE + S2R_ECL_APSC + 8);
+        printf("FDT: E-cluster PSTATE 0x%lx APSC 0x%lx/0x%lx saved for ACC_OVRD_DEEP_SLEEP resumes\n",
+               s2r_linux_resume.ecl_pstate, s2r_linux_resume.ecl_apsc[0],
+               s2r_linux_resume.ecl_apsc[1]);
+    }
     /* the boot CPU (Aff 0.0) gets the top stack, as dummy_stack before */
     _reset_stack = s2r_linux_stacks + sizeof(s2r_linux_stacks);
     s2r_reset_stack_stride = S2R_LINUX_STACK_SIZE;
@@ -2715,6 +2889,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_acio_tunables())
         return -1;
     if (dt_set_pcie_tunables())
+        return -1;
+    if (dt_set_apcie_tunables())
         return -1;
     if (dt_set_display())
         return -1;

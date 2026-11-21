@@ -722,6 +722,32 @@ static int pcie_init_controller(int controller, const char *path)
     return 0;
 }
 
+int pcie_t8103_fuse_tunables(const char *path, u32 *out, int max)
+{
+    int adt_path[8];
+    int node = adt_path_offset_trace(adt, path, adt_path);
+    u64 fuse_base;
+    int n = 0;
+
+    if (node < 0 || !adt_is_compatible(adt, node, "apcie,t8103"))
+        return -1;
+    if (adt_get_reg(adt, adt_path, "reg", regs_t8xxx_t600x.fuse_idx, &fuse_base, NULL))
+        return -1;
+
+    for (int i = 0; pcie_fuse_bits_t8103[i].width; i++) {
+        const struct fuse_bits *f = &pcie_fuse_bits_t8103[i];
+        u32 fuse = (read32(fuse_base + f->src_reg) >> f->src_bit) & ((1 << f->width) - 1);
+
+        if (n >= max)
+            return -1;
+        out[3 * n] = f->tgt_reg;
+        out[3 * n + 1] = ((1 << f->width) - 1) << f->tgt_bit;
+        out[3 * n + 2] = fuse << f->tgt_bit;
+        n++;
+    }
+    return n;
+}
+
 int pcie_init(void)
 {
     bool success = false;

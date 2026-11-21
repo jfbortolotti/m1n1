@@ -394,7 +394,18 @@ class EPICEp(AFKEp):
                 self.log(f"Response {sub.type}: {cmd.retcode:#x}")
                 return
 
-            data = self.dart.ioread(self.stream, cmd.rxbuf, cmd.rxlen)
+            # trace 13: the ep 0x2c CBAPToDCPService reply header parses to garbage (rxbuf 0x81000..., huge
+            # rxlen): reading it page by page through the proxy stalled the guest for minutes
+            if cmd.rxbuf >> 40 or cmd.rxlen > 0x10000:
+                self.log(f"Response {sub.type}: {cmd.retcode:#x}, implausible rxbuf {cmd.rxbuf:#x} "
+                         f"len {cmd.rxlen:#x}, not read")
+                return
+            try:
+                data = self.dart.ioread(self.stream, cmd.rxbuf, cmd.rxlen)
+            except Exception as e:
+                # trace 13: some replies (ep 0x2c CBAPToDCPService) carry a non-DVA rxbuf
+                self.log(f"Response {sub.type}: {cmd.retcode:#x}, rxbuf {cmd.rxbuf:#x} len {cmd.rxlen:#x} not readable ({e})")
+                return
             if len(data) < 16:
                 self.log(f"EPIC: short reply, len={len(data)}")
                 chexdump(data, print_fn=self.log)
@@ -416,6 +427,11 @@ class EPICEp(AFKEp):
     def handle_cmd(self, hdr, sub, fd):
         cmd = EPICCmd.parse_stream(fd)
         payload = fd.read()
+        if cmd.txbuf and (cmd.txbuf >> 40 or cmd.txlen > 0x10000):
+            self.log(f"Command {sub.type}: implausible txbuf {cmd.txbuf:#x} len {cmd.txlen:#x}, not read")
+            if payload:
+                chexdump(payload, print_fn=self.log)
+            return
 
         if sub.type == EPICSubtype.STD_SERVICE and cmd.txbuf:
             data = self.dart.ioread(self.stream, cmd.txbuf, cmd.txlen)
@@ -819,8 +835,9 @@ class DCPCallChannel(Reloadable):
                 print(f"{dir} Input ({len(data_in):#x} bytes):")
                 chexdump(data_in[:self.state.max_len])
 
-        #if tag not in KNOWN_MSGS:
-            #hv.run_shell()
+        if tag not in KNOWN_MSGS:
+            # 2026-11-16: log unknown calls' arguments (A500 before the DCP power-off), print() is lost
+            self.log(f"{dir}{self.name}.{msg.OFF:x} {tag} unknown: in {in_len:#x} out {out_len:#x}: {data_in.hex()}")
 
         if self.state.dumpfile:
             dump = f"CALL {dir} {msg.value:#018x} {self.name} {state.off:#x} {state.tag} {in_len:#x} {out_len:#x} {data_in.hex()}\n"
@@ -843,6 +860,9 @@ class DCPCallChannel(Reloadable):
             self.log(f"{dir}ACK {self.name}.{msg.OFF:x} ({msg})")
 
         data_out = self.dcpep.dart.ioread(self.dcpep.stream, self.state.shmem_iova + state.out_addr, state.out_len)
+
+        if state.tag not in KNOWN_MSGS:
+            self.log(f"{dir}ACK {self.name}.{msg.OFF:x} {state.tag} unknown: out {state.out_len:#x}: {data_out.hex()}")
 
         verb = self.dcpep.get_verbosity(state.tag)
         if verb >= 3 and state.out_len > 0:
@@ -1424,7 +1444,12 @@ class DCPTracer(ASCTracer):
     }
 
     def handle_msg(self, direction, r0, r1):
-        super().handle_msg(direction, r0, r1)
+        # trace 13: a decode error must not stop the guest (it dropped macOS into the HV shell)
+        try:
+            super().handle_msg(direction, r0, r1)
+        except Exception:
+            import traceback
+            self.log("DECODE ERROR (event skipped, guest continues):\n" + traceback.format_exc())
         #iomon.poll()
 
 # get get the SID used by DCP from the only child of "dart-dcp*"

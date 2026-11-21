@@ -89,11 +89,29 @@ struct s2r_linux_cpu {
     u64 pad[3];
 };
 
+/*
+ * ACC_OVRD_DEEP_SLEEP of the E cluster (Linux cpuidle_apple.ecluster_deep, 2026-11-15): the whole
+ * cluster may lose power, and with it the DVFS registers m1n1's cpufreq_init() set at boot. kboot
+ * saves them in ecl_*; when Linux sets S2R_LINUX_F_ECL_RESTORE in ->flags before the boot CPU's
+ * gated WFI, the boot CPU resume path re-applies those that differ and reports it in ->restored.
+ */
+#define S2R_LINUX_F_ECL_RESTORE  BIT(0)
+#define S2R_ECL_RESTORED_APSC    BIT(0)
+#define S2R_ECL_RESTORED_PSTATE  BIT(1)
+#define S2R_ECL_RESTORED_TIMEOUT BIT(2)
+#define S2R_ECL_RESTORED_DONE    BIT(63)
+#define S2R_T8103_ECL_BASE       0x210e00000UL
+#define S2R_ECL_PSTATE           0x20020
+#define S2R_ECL_APSC             0x70210
+
 struct s2r_linux_resume {
     u64 magic;
     u64 entry;
-    u64 count; /* resumes done, for Linux's statistics */
-    u64 pad[5];
+    u64 count;      /* resumes done, for Linux's statistics */
+    u64 flags;      /* Linux: S2R_LINUX_F_* for the next boot CPU resume */
+    u64 ecl_pstate; /* kboot: E-cluster CLUSTER_PSTATE (0 = not T8103, nothing to restore) */
+    u64 ecl_apsc[2];
+    u64 restored;   /* m1n1: S2R_ECL_RESTORED_* of the last boot CPU resume */
     struct s2r_linux_cpu cpu[S2R_LINUX_MAX_CPUS];
 } __attribute__((aligned(64)));
 extern struct s2r_linux_resume s2r_linux_resume;

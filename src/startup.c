@@ -244,6 +244,42 @@ u64 s2r_reset_stack_stride;
  * MMU and caches off, Linux owns every device: no printf, no MMU setup. Only the CPU init
  * (chicken bits, CYC_OVRD, counter redirect...) that Linux expects from m1n1, then cpu_resume.
  */
+/* MMU off: plain device accesses. Mask: status bits of CLUSTER_PSTATE (BUSY, SET, APSC_BUSY) */
+#define S2R_ECL_PSTATE_STATUS (BIT(31) | BIT(25) | BIT(7))
+static void s2r_linux_ecl_restore(void)
+{
+    struct s2r_linux_resume *r = &s2r_linux_resume;
+    u64 base = S2R_T8103_ECL_BASE, res = S2R_ECL_RESTORED_DONE;
+
+    if (!(r->flags & S2R_LINUX_F_ECL_RESTORE) || !r->ecl_pstate) {
+        r->restored = 0;
+        return;
+    }
+    if (read64(base + S2R_ECL_APSC) != r->ecl_apsc[0] ||
+        read64(base + S2R_ECL_APSC + 8) != r->ecl_apsc[1]) {
+        write64(base + S2R_ECL_APSC, r->ecl_apsc[0]);
+        write64(base + S2R_ECL_APSC + 8, r->ecl_apsc[1]);
+        res |= S2R_ECL_RESTORED_APSC;
+    }
+    /*
+     * Linux's cpufreq changes the P-state, never the APSC copy: only a cluster whose APSC copy
+     * was lost (reset by the power-down) gets its boot PSTATE back.
+     */
+    u64 cur = read64(base + S2R_ECL_PSTATE);
+    if ((res & S2R_ECL_RESTORED_APSC) &&
+        (cur & ~S2R_ECL_PSTATE_STATUS) != (r->ecl_pstate & ~S2R_ECL_PSTATE_STATUS)) {
+        write64(base + S2R_ECL_PSTATE, (r->ecl_pstate & ~S2R_ECL_PSTATE_STATUS) | BIT(25));
+        res |= S2R_ECL_RESTORED_PSTATE;
+        int i;
+        for (i = 0; i < 1000000; i++)
+            if (!(read64(base + S2R_ECL_PSTATE) & BIT(31)))
+                break;
+        if (i == 1000000)
+            res |= S2R_ECL_RESTORED_TIMEOUT;
+    }
+    r->restored = res;
+}
+
 static void __attribute__((noreturn)) s2r_linux_resume_entry(void)
 {
     u64 entry = s2r_linux_resume.entry;
@@ -252,6 +288,8 @@ static void __attribute__((noreturn)) s2r_linux_resume_entry(void)
     s2r_linux_resume.count++;
     sysop("dsb sy");
     init_cpu_quiet();
+    s2r_linux_ecl_restore();
+    sysop("dsb sy");
     sysop("isb");
     ((void (*)(void))entry)();
     while (1)
@@ -264,14 +302,56 @@ static void __attribute__((noreturn)) s2r_linux_cpu_entry(struct s2r_linux_cpu *
     u64 entry = slot->entry;
     u64 acc = slot->acc_ovrd;
 
+    /*
+     * Hold (review K1, 2026-11-19), park deep only: pad[1] == 1 means wait online, in WFE, until Linux
+     * writes 2 (release) or 3 (abort) there, so the core is up across the PMGR 'go' as XNU's are.
+     * After a release, pad[2] (if not 0) is a PMGR PS register (CPU0's): wait until it reads off, so
+     * this core goes down last, as XNU's P cores do (trace 16). ACC_OVRD is written after the hold.
+     */
+    bool hold = !entry && slot->pad[1] == 1;
+
     slot->magic = 0;
     slot->count++;
     sysop("dsb sy");
     init_cpu_quiet();
     reg_clr(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_DISABLE_WFI_RET);
-    if (acc)
+    if (acc && !hold)
         msr(SYS_IMP_APL_ACC_OVRD, acc);
     sysop("isb");
+    /*
+     * entry == 0: park deep (Linux apple_cpuhp_park_deep, 2026-11-18). Linux restarted this core
+     * after the PMGR SoC-sleep 'go' only to take it down again as XNU does (HV trace 15: CPU7..1
+     * write ACC_OVRD with DEEP_SLEEP, already in ->acc_ovrd, and CYC_OVRD 0x3000001 after the go).
+     * pad[0] = CPUSTART register: write this core's stop bit first (XNU disableCPUCore).
+     */
+    if (!entry) {
+        u64 mpidr = mrs(MPIDR_EL1);
+        u64 cpustart = slot->pad[0];
+        u64 waitps = slot->pad[2];
+
+        if (hold) {
+            u64 v;
+
+            while ((v = read64((u64)&slot->pad[1])) == 1)
+                sysop("wfe");
+            if (v == 2 && waitps)
+                while ((read32(waitps) & 0xf0) == 0xf0 && read64((u64)&slot->pad[1]) != 3)
+                    ;
+            if (acc)
+                msr(SYS_IMP_APL_ACC_OVRD, acc);
+            sysop("isb");
+        }
+
+        if (cpustart)
+            write32(cpustart, 1 << (4 * ((mpidr >> 8) & 0xff) + (mpidr & 0xff)));
+        reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK | CYC_OVRD_DISABLE_WFI_RET,
+                 CYC_OVRD_WFI_MODE(3) | CYC_OVRD_DISABLE_WFI_RET);
+        sysop("isb");
+        while (1) {
+            sysop("dsb sy");
+            sysop("wfi");
+        }
+    }
     ((void (*)(void))entry)();
     while (1)
         sysop("wfi");
@@ -292,6 +372,21 @@ static struct s2r_linux_cpu *s2r_linux_cpu_slot(void)
 
 void _cpu_reset_c(void *stack)
 {
+#ifdef S2R_WAKE_DIAG
+    /*
+     * Wake diagnostic build (2026-11-18): the boot CPU coming back at RVBAR with the Linux resume
+     * armed resets the SoC at once through the AP watchdog (0x23d2b0000). A return to m1n1 a few
+     * seconds after the power button press (instead of the 178 s AON watchdog) then proves that
+     * the hardware wake path reached RVBAR, independently of the m1n1/Linux resume code.
+     */
+    if (is_boot_cpu() && s2r_linux_resume.magic == S2R_LINUX_RESUME_MAGIC) {
+        write32(0x23d2b0014, 0x1000);
+        write32(0x23d2b0010, 0);
+        write32(0x23d2b001c, 4);
+        while (1)
+            sysop("wfe");
+    }
+#endif
     if (is_boot_cpu() && s2r_linux_resume.magic == S2R_LINUX_RESUME_MAGIC)
         s2r_linux_resume_entry();
     if (!is_boot_cpu()) {

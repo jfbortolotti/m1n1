@@ -176,7 +176,7 @@ def run_shell(locals, msg=None, exitmsg=None, poll_func=None):
                     desc = obj_name + str(signature(obj))
                 except:
                     continue
-                qn = obj.__qualname__
+                qn = getattr(obj, "__qualname__", obj_name)
                 if qn.find('.') > 0:
                     a = qn.split('.')
                     if a[0] not in subcmd_list:

@@ -138,6 +138,50 @@ void run_actions(void)
     uartproxy_run(NULL);
 }
 
+/*
+ * Early battery meter (2026-11-20): read the gauge keys once, before any proxy/USB, so a run that
+ * ends in a reset (whole-SoC attempt + 178 s watchdog) can be measured: the PC reads this struct
+ * later over the proxy (proxyclient: early_meter.py), after the USB-C is plugged in and charging.
+ */
+#include "smc.h"
+struct early_meter {
+    u64 magic; /* 'BAACMETR' when valid */
+    u64 cntpct, cntfrq;
+    s64 baac;
+    u16 b0rm, b0av;
+    s16 b0ac;
+    u16 ok;
+};
+struct early_meter early_meter;
+
+static void early_meter_read(void)
+{
+    smc_dev_t *smc = smc_init();
+    s64 baac = 0;
+    u16 rm = 0, av = 0;
+    s16 ac = 0;
+
+    if (!smc) {
+        printf("early_meter: no SMC\n");
+        return;
+    }
+    early_meter.cntpct = mrs(CNTPCT_EL0);
+    early_meter.cntfrq = mrs(CNTFRQ_EL0);
+    early_meter.ok = !smc_read(smc, 0x42414143 /* BAAC */, &baac, 8);
+    early_meter.ok |= (!smc_read(smc, 0x4230524d /* B0RM */, &rm, 2)) << 1;
+    early_meter.ok |= (!smc_read(smc, 0x42304143 /* B0AC */, &ac, 2)) << 2;
+    early_meter.ok |= (!smc_read(smc, 0x42304156 /* B0AV */, &av, 2)) << 3;
+    early_meter.baac = baac;
+    early_meter.b0rm = rm;
+    early_meter.b0ac = ac;
+    early_meter.b0av = av;
+    early_meter.magic = 0x5254454d43414142ULL; /* "BAACMETR" */
+    smc_shutdown(smc);
+    printf("early_meter @%p: BAAC %ld B0RM %u mAh B0AC %d mA B0AV %u mV (ok %#x) at %lu\n",
+           &early_meter, baac, rm,
+           ac, av, early_meter.ok, early_meter.cntpct);
+}
+
 void m1n1_main(void)
 {
     printf("\n\nm1n1 %s\n", m1n1_version);
@@ -160,6 +204,7 @@ void m1n1_main(void)
     wdt_disable();
 #ifndef BRINGUP
     pmgr_init();
+    early_meter_read();
 #ifdef USE_FB
     display_init();
     // Kick DCP to sleep, so dodgy monitors which cause reconnect cycles don't cause us to lose the

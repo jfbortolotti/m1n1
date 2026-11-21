@@ -54,6 +54,16 @@
 #   sleep-time 0x63 command (_cmd8_*). The boot dumps alone are enough; sleep is optional.
 #   From the shell: s2r_pmp_dump("manual") dumps it again at any time.
 #
+# TRACE 11 (PMGR wake-source / reconfig arming, 2026-11-14): Linux deep sleep with the SMC told
+#   MBSE='slpw' never wakes (the SMC then signals the wake only on its hardware line, PMGR
+#   ap-wake-source SMC.CPUWakeupAP 76). Traces 4-8 missed two things: boot-time PMGR writes
+#   (MMIO tracers attached only before sleep) and every PMGR range > 1 MiB. So:
+#     S2R_TRACE_PROFILE=pmgrboot S2R_TRACE_PMGR_MAX=0x1000000 S2R_TRACE_LOG=/tmp/s2r_trace11.log \
+#     S2R_TRACE_SEP_DUMPS=0  (+ the trace 5 command line; see scripts/run_trace11.sh)
+#   then, after login, sudo pmset sleepnow: the sleep-time MMIO tracers attach by themselves
+#   on MBSE='slpw' (S2R_TRACE_AUTO_ATTACH=1, default). If the boot gets too slow, drop reg32 from
+#   S2R_TRACE_BOOT_PMGR; if the sleep attach is too slow, S2R_TRACE_PMGR_SKIP=33,34,...
+#
 # TRACE 9 (SEP set-up, app loading and sleep): same command as trace 5 with
 #   S2R_TRACE_LOG=/tmp/s2r_trace9.log. The SEP mailbox is decoded in the SEP's own format
 #   (">sep ... ep= tag= type= param= data=" lines) and the buffers behind the cntl OOL set-up,
@@ -111,6 +121,7 @@
 #   S2R_TRACE_AOP            0 (default) / 1: AOP mailbox (very chatty)
 #   S2R_TRACE_SPMI           1 (default) / 0: nub-spmi/nub-spmi1 MMIO writes (PMU access)
 #   S2R_TRACE_SYSREG_READS   0 (default) / 1
+#   S2R_TRACE_SLEEP_EXTRA    "name:start:size,..." extra ranges traced from the sleep attach (trace 16)
 #
 # LOG FORMAT (one event per line, easy to grep/parse):
 #   <seconds since start> <cpuN|---> <TAG> <text>
@@ -184,9 +195,32 @@ S2R_SKIP_PAGES = sorted(
     for x in _env("S2R_TRACE_SKIP", "0x23bc34000").split(",")
     if x.strip())
 S2R_HOT_ADDR = 0x23b738008
+# trace 13: the E-core flag 0x23b738004 (same idle-path PC as +8) goes to the same per-CPU ring
+S2R_HOT_ADDRS = (0x23b738004, 0x23b738008)
+# trace 13: extra ranges traced (writes, ASYNC) from boot in the boot/pmgrboot profiles,
+# "name:start:size,..." e.g. "MCC:0x200000000:0x400000,VOTE:0x23b738000:0x4000"
+S2R_BOOT_EXTRA = [x.split(":") for x in _env("S2R_TRACE_BOOT_EXTRA", "").split(",") if x.strip()]
+# trace 16: extra ranges traced (writes, ASYNC) when the sleep-time tracers attach (MBSE='slpw'),
+# same "name:start:size,..." format, e.g. "MCC:0x200000000:0x400000"
+S2R_SLEEP_EXTRA = [x.split(":") for x in _env("S2R_TRACE_SLEEP_EXTRA", "").split(",") if x.strip()]
 S2R_HOT_KEEP = int(_env("S2R_TRACE_HOT_KEEP", "200"))
 S2R_DBGTXT_ADDR = 0x23d12c004
 S2R_SEP = _env("S2R_TRACE_SEP", "1") == "1"
+# PMGR ranges larger than this are not traced (traces 4-8 used 1 MiB: 21 of the 54 /arm-io/pmgr
+# ranges were skipped, among them reg32 = the PMGR bridge 0x23b800000+0x280000 and the 16 MiB
+# ranges reg33-47). Trace 11 raises it to 16 MiB to look for the wake-source / reconfig arming.
+S2R_PMGR_MAX = int(_env("S2R_TRACE_PMGR_MAX", "0x100000"), 16)
+# /arm-io/pmgr reg indices never traced (comma separated), e.g. a range that turns out too hot
+S2R_PMGR_SKIP = {int(x, 0) for x in _env("S2R_TRACE_PMGR_SKIP", "").split(",") if x.strip()}
+# profile "pmgrboot": PMGR reg indices traced from the very start (boot), ASYNC. Default:
+# reg1 AON PMGR (0x23d280000), reg3 (0x23d200000), reg4 (0x23d004000), reg32 the bridge.
+S2R_BOOT_PMGR = [int(x, 0) for x in _env("S2R_TRACE_BOOT_PMGR", "1,3,4,32").split(",") if x.strip()]
+# boot / pmgrboot profiles: attach the sleep-time MMIO tracers by themselves when macOS writes the
+# SMC key MBSE = 'slpw' (first step of its sleep, trace 10 at 183.27 s, before the drivers
+# suspend). Needed when run_guest runs with "sleep infinity |" as stdin: the hypervisor shell
+# then cannot be typed into, so s2r_attach_sleep() could never be called (trace 10 has no MMIO).
+# The new tracers are applied by the hypervisor's pt_update() at the end of that SMC trap.
+S2R_AUTO_ATTACH = _env("S2R_TRACE_AUTO_ATTACH", "1") == "1"
 
 ACC_OVRD_DEEP_SLEEP = 1 << 34
 
@@ -226,6 +260,10 @@ class S2RLog:
                 self.last_fsync = t
         except Exception as e:  # never break the guest because of the log
             print(f"(log write failed: {e})")
+        try:
+            s2r_pswatch_tick(t)
+        except NameError:       # defined further down
+            pass
         return t
 
     def dump_window(self, seconds, label):
@@ -427,7 +465,7 @@ def s2r_hot_flush(reason):
     if not total:
         return
     s2r_log.emit("HOT", None, f"--- last {S2R_HOT_KEEP} per CPU 0/1 writes to "
-                              f"{S2R_HOT_ADDR:#x} before: {reason} ({_hot_count} so far) ---")
+                              f"0x23b738004/8 before: {reason} ({_hot_count} so far) ---")
     for cpu in sorted(_hot_ring):
         for (t, line) in _hot_ring[cpu]:
             s2r_log.emit("HOT", cpu, f"[t={t:.4f}] {line}")
@@ -439,7 +477,7 @@ def s2r_mmio_write(evt, name=None, base=None):
     bits = 8 << evt.flags.WIDTH
     cpu = evt.flags.CPU
 
-    if evt.addr == S2R_HOT_ADDR and evt.data in (0, 1):
+    if evt.addr in S2R_HOT_ADDRS and evt.data in (0, 1):
         _hot_count += 1
         ring = _hot_ring.setdefault(cpu, collections.deque(maxlen=S2R_HOT_KEEP))
         ring.append((s2r_log.now(), f"W{bits} {evt.addr:#x} = {evt.data:#x} pc={evt.pc:#x}"))
@@ -510,7 +548,7 @@ def s2r_trace_range(name, start, size, mode=None):
     return True
 
 
-def s2r_trace_node_regs(path, name, max_size=0x100000, ranges=None):
+def s2r_trace_node_regs(path, name, max_size=0x100000, ranges=None, skip=()):
     try:
         node = hv.adt[path]
     except Exception:
@@ -518,6 +556,9 @@ def s2r_trace_node_regs(path, name, max_size=0x100000, ranges=None):
         return
     for i in range(len(node.reg)):
         if ranges is not None and i not in ranges:
+            continue
+        if i in skip:
+            s2r_log.emit("HV", None, f"{path} reg{i}: skipped (S2R_TRACE_PMGR_SKIP)")
             continue
         addr, size = node.get_reg(i)
         if size > max_size:
@@ -532,7 +573,7 @@ def s2r_setup_mmio():
 
     # PMGR (+ AON PMGR, cluster regs). cpu_start (pmgr0+0x54000) is already hooked by the
     # hypervisor itself ("CPUSTART W ..." lines come from hv.log).
-    s2r_trace_node_regs("/arm-io/pmgr", "PMGR")
+    s2r_trace_node_regs("/arm-io/pmgr", "PMGR", max_size=S2R_PMGR_MAX, skip=S2R_PMGR_SKIP)
     try:
         p0 = hv.adt["/arm-io/pmgr"].get_reg(0)[0]
         _pmgr_cpustart = (p0 + 0x54000, p0 + 0x54020)
@@ -571,6 +612,10 @@ def s2r_setup_mmio():
                 s2r_trace_range("AIC-target", aic0 + 0x3000, 0x1000)
         except Exception as e:
             s2r_log.emit("HV", None, f"AIC not traced: {e}")
+
+    # trace 16: blocks outside /arm-io/pmgr (MCC, PMP-owned ranges, AON AES, ...)
+    for (_n, _a, _sz) in S2R_SLEEP_EXTRA:
+        s2r_trace_range(_n, int(_a, 0), int(_sz, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +684,65 @@ def s2r_pmp_dump(tag, dva=None, size=None):
 
 
 _s2r_pmp_pending = []
+
+# ---------------------------------------------------------------------------
+# PSWATCH (2026-11-15): when does the macOS PMP lower PS_AUTO (bits 27:24) of the domains it owns?
+# Linux keeps DCS0-7 at auto F/4, PCIE_REF F, RMX F; macOS has them at 0/4 awake and asleep, and
+# the macOS CPU never writes them (trace 11). On any logged event, at most every
+# S2R_TRACE_PSWATCH_S seconds, a read of these registers is queued (deferred user-IRQ context,
+# where proxy reads work) and every change is logged: PSWATCH <name> <old> -> <new>.
+# ---------------------------------------------------------------------------
+S2R_PSWATCH = _env("S2R_TRACE_PSWATCH", "0") == "1"
+S2R_PSWATCH_S = float(_env("S2R_TRACE_PSWATCH_S", "0.25"))
+S2R_PSWATCH_REGS = [
+    ("DCS0", 0x23b700300), ("DCS1", 0x23b700310), ("DCS2", 0x23b700308), ("DCS3", 0x23b700318),
+    ("DCS4", 0x23b700320), ("DCS5", 0x23b700330), ("DCS6", 0x23b700328), ("DCS7", 0x23b700338),
+    ("MCC", 0x23b7002f8), ("SBR", 0x23b700100), ("IMX", 0x23b7001b8), ("SMX", 0x23b700340),
+    ("RMX", 0x23b700350), ("PCIE_REF", 0x23b7001a0), ("APCIE", 0x23b700348),
+    ("APCIE_GP", 0x23b7003e8), ("DISP0_FE", 0x23b700360), ("DISP0_CPU0", 0x23b710018),
+    ("PMP", 0x23b7003d8), ("PMS", 0x23b700140), ("PMS_SRAM", 0x23b7003e0),
+    ("ANS2", 0x23b7003f0), ("SIO", 0x23b7001c8), ("SIO_BUSIF", 0x23b7001c0),
+]
+_s2r_psw = {"last": -1e9, "queued": False, "busy": False, "vals": {}, "n": 0}
+
+
+def _psw_fmt(v):
+    return f"{v:08x} (auto {(v >> 24) & 0xf:x}{'+' if v & (1 << 28) else '-'} act {(v >> 4) & 0xf:x})"
+
+
+def s2r_pswatch():
+    w = _s2r_psw
+    w["queued"] = False
+    w["busy"] = True
+    try:
+        changes = []
+        for name, addr in S2R_PSWATCH_REGS:
+            try:
+                v = hv.p.read32(addr)
+            except Exception as e:
+                v = None
+            old = w["vals"].get(name)
+            if v is not None and v != old:
+                w["vals"][name] = v
+                changes.append((name, old, v))
+        w["n"] += 1
+        for name, old, v in changes:
+            if old is None:
+                s2r_log.emit("PSWAT", None, f"PSWATCH {name} = {_psw_fmt(v)}")
+            else:
+                s2r_log.emit("PSWAT", None, f"PSWATCH {name} {_psw_fmt(old)} -> {_psw_fmt(v)}")
+    finally:
+        w["busy"] = False
+
+
+def s2r_pswatch_tick(t):
+    w = _s2r_psw
+    if not S2R_PSWATCH or w["busy"] or w["queued"] or t - w["last"] < S2R_PSWATCH_S:
+        return
+    w["last"] = t
+    w["queued"] = True
+    _s2r_pmp_pending.append(("__call__", s2r_pswatch))
+    hv.interrupt()
 
 # Snapshot of the power/clock state (same register list and "SNAP" format as s2r_snapshot() in
 # src/s2r.c), taken automatically at the first ANCHOR (the guest's first enDeepSleep write, i.e.
@@ -894,8 +998,16 @@ def s2r_setup_mailboxes():
     def keyname(k):
         return k.to_bytes(4, "big").decode("ascii", errors="replace")
 
+    class S2RSMCAnyMessage(Register64):
+        # SMCMessage has UNK = 11:8 Constant(0); the tracer parses every message with the
+        # base class, replies included, and a reply with bits 11:8 set (trace 11 boot, after a
+        # B0NC read) raised an AssertionError that stopped the guest in the debug shell.
+        TYPE = 7, 0
+        UNK = 11, 8
+        ID = 15, 12
+
     class S2RSMCEp(EP):
-        BASE_MESSAGE = SMCMessage
+        BASE_MESSAGE = S2RSMCAnyMessage
 
         def __init__(self, tracer, epid):
             super().__init__(tracer, epid)
@@ -924,6 +1036,12 @@ def s2r_setup_mailboxes():
             self.state.rb[m.ID] = m.TYPE, key, m.SIZE
             data = self.hv.iface.readmem(self.state.sram_addr, m.SIZE) if self.state.sram_addr else b""
             self.log(f"[{m.ID:x}] >W: <{key}> = {data.hex()} ({m.SIZE}){self.flag(key)}")
+            if (key == "MBSE" and data[:4] in (b"wpls", b"slpw") and S2R_AUTO_ATTACH
+                    and not _s2r_mmio_attached):
+                try:
+                    s2r_attach_sleep(reason="SMC MBSE='slpw' (auto)")
+                except Exception as e:
+                    s2r_log.emit("HV", None, f"auto attach failed: {e}")
             return True
 
         @msg(SMC_READ_KEY, DIR.TX, SMCReadKey)
@@ -1148,6 +1266,8 @@ def s2r_log_adt_context():
 
 # S2R_TRACE_PROFILE:
 #   "full" (default): everything is traced from the moment the script runs (late attach).
+#   "pmgrboot" (trace 11): as "boot", plus the PMGR ranges S2R_TRACE_BOOT_PMGR (default AON PMGR,
+#          reg3, reg4, bridge reg32) and the AON GPIO controllers traced from the start.
 #   "boot" (trace 5, early attach with run_guest.py -m): only the light ASYNC mailbox tracers
 #          (PMP, SEP) and the SMC tracer run from the start, so the boot-time PMP/SEP set-up
 #          (e.g. how macOS opens PMP endpoint 0x20) is captured without slowing the boot down.
@@ -1157,27 +1277,48 @@ S2R_PROFILE = _env("S2R_TRACE_PROFILE", "full")
 _s2r_mmio_attached = False
 
 
-def s2r_attach_sleep():
-    """Add the MMIO tracers (boot profile): call from the hypervisor shell right before sleep."""
+def s2r_attach_sleep(reason="manual"):
+    """Add the MMIO tracers (boot profiles): automatic on MBSE='slpw', or from the shell."""
     global _s2r_mmio_attached
     if _s2r_mmio_attached:
         print("MMIO tracers already attached")
         return
-    s2r_mark("attach MMIO tracers for the sleep sequence")
+    s2r_mark(f"attach MMIO tracers for the sleep sequence ({reason})")
     s2r_setup_mmio()
     _s2r_mmio_attached = True
     print("MMIO tracers added, they take effect when the guest continues (hv.cont()).")
 
 
-if S2R_PROFILE == "boot":
+if S2R_PROFILE in ("boot", "pmgrboot"):
     S2R_PMP = True   # the PMP boot-time set-up is the point of this profile
+
+
+def s2r_setup_boot_pmgr():
+    """Profile pmgrboot: the AON / bridge PMGR ranges and the AON GPIO controllers from boot.
+
+    Traces 4-8 attached every MMIO tracer only right before sleep, so anything macOS (or its
+    kexts) arms once at boot -- PMGR wake sources (ADT ap-wake-sources), the reconfig engine
+    program, GPIO wake events -- was never seen. These ranges are written rarely, so tracing
+    them from the start should not slow the boot the way the full MMIO set does.
+    """
+    s2r_build_ps_map()
+    s2r_trace_node_regs("/arm-io/pmgr", "PMGR", max_size=S2R_PMGR_MAX,
+                        ranges=S2R_BOOT_PMGR, skip=S2R_PMGR_SKIP)
+    for path, name in (("/arm-io/aop-gpio", "AOPGPIO"), ("/arm-io/nub-gpio", "NUBGPIO"),
+                       ("/arm-io/smc-gpio", "SMCGPIO")):
+        s2r_trace_node_regs(path, name, ranges=[0])
 
 s2r_log.emit("MARK", None, f"START log={S2R_LOG_PATH} profile={S2R_PROFILE} "
                            f"window={S2R_WINDOW_S}s aic={S2R_AIC_MODE} "
                            f"pmp={int(S2R_PMP)} sep={int(S2R_SEP)} aop={int(S2R_AOP)} "
                            f"spmi={int(S2R_SPMI)}")
 s2r_log_adt_context()
-if S2R_PROFILE != "boot":
+if S2R_PROFILE == "pmgrboot":
+    s2r_setup_boot_pmgr()
+if S2R_PROFILE in ("boot", "pmgrboot"):
+    for (_n, _a, _sz) in S2R_BOOT_EXTRA:
+        s2r_trace_range(_n, int(_a, 0), int(_sz, 0))
+elif S2R_PROFILE != "boot":
     s2r_setup_mmio()
     _s2r_mmio_attached = True
 try:
@@ -1189,10 +1330,15 @@ except Exception as e:
 
 print("\n" + "=" * 70)
 print(f"S2R wake-arming trace ready (profile {S2R_PROFILE}). Log: {S2R_LOG_PATH}")
-if S2R_PROFILE == "boot":
-    print("Only the SMC/PMP/SEP mailboxes are traced now. After logging in to macOS:")
+if S2R_PROFILE in ("boot", "pmgrboot"):
+    print("Only the SMC/PMP/SEP mailboxes are traced now"
+          + (" (+ AON/bridge PMGR, AON GPIOs)" if S2R_PROFILE == "pmgrboot" else "")
+          + ". After logging in to macOS:")
     print("    sudo -v && (sleep 30; sudo pmset sleepnow) &      (in a macOS terminal)")
-    print("then Ctrl-C here and:   s2r_attach_sleep()   then   hv.cont()")
+    if S2R_AUTO_ATTACH:
+        print("The sleep-time MMIO tracers attach by themselves on SMC MBSE='slpw' (no Ctrl-C needed).")
+    else:
+        print("then Ctrl-C here and:   s2r_attach_sleep()   then   hv.cont()")
 else:
     print("Continue the guest, boot macOS, then run   sudo pmset sleepnow   in a macOS terminal.")
 print("Anchors (deep ACC_OVRD / CYC_OVRD / CPU shutdown) are marked and the last")
